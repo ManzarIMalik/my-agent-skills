@@ -30,6 +30,8 @@ my-agent-skills/
 ### Code Analysis
 - **[Code Review Assistant](skills/code-analysis/code-review-assistant.md)** - Comprehensive code reviews with security focus
 - **[Codebase Explorer](skills/code-analysis/codebase-explorer.md)** - Quick codebase understanding and architecture mapping
+- **[Refactoring Assistant](skills/code-analysis/refactoring-assistant.md)** - Improve code quality and maintainability
+- **[Security Vulnerability Scanner](skills/code-analysis/security-scanner.md)** - Identify and fix security vulnerabilities
 
 ### Documentation
 - **[Documentation Generator](skills/documentation/documentation-generator.md)** - API docs, README files, inline comments
