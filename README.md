@@ -1,8 +1,8 @@
-<div align="center">
+<!-- <div align="center">
   <a href="https://agentskills.io">
     <img src="assets/cover-image.png" alt="Agent Skills" width="90%">
   </a>
-</div>
+</div> -->
 
 # My Agent Skills [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
 
