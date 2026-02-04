@@ -2,6 +2,12 @@
 
 A curated collection of agent skills and prompts for AI-powered development assistants. These skills help automate common development tasks, improve code quality, and accelerate software development workflows.
 
+---
+
+**📖 Navigation:** [Getting Started](GETTING_STARTED.md) • [Quick Reference](QUICK_REFERENCE.md) • [Skills Index](SKILLS_INDEX.md) • [Contributing](CONTRIBUTING.md)
+
+---
+
 ## 📚 What Are Agent Skills?
 
 Agent skills are specialized prompts and workflows designed for AI coding assistants (like GitHub Copilot, Cursor, etc.). Each skill provides:
@@ -46,6 +52,8 @@ my-agent-skills/
 - **[Deployment Automation](skills/deployment/deployment-automation.md)** - CI/CD pipelines, Docker, Kubernetes configs
 
 ## 💡 How to Use
+
+> **New here?** Check out the [Getting Started Guide](GETTING_STARTED.md) for a quick 5-minute tutorial!
 
 ### 1. Browse the Skills
 Navigate through the `skills/` directory to find a skill that matches your need.
