@@ -63,7 +63,7 @@ ENTRYPOINT ["<start command>"]
 | **Node / TypeScript** | `node:<lts>` | `node:<lts>-slim` or distroless Node | compiled JS + production `node_modules` only |
 | **Python** | `python:<v>` (+ uv/Poetry) | `python:<v>-slim` | virtualenv copied from build stage + source |
 | **PHP** | `composer` + `php:<v>-cli` | `php:<v>-fpm` (+ nginx) or FrankenPHP | `vendor/` (no dev deps) + source, OPcache enabled |
-| **Ruby** | `ruby:<v>` | `ruby:<v>-slim` | `bundle install --without development test` + precompiled assets |
+| **Ruby** | `ruby:<v>` | `ruby:<v>-slim` | `BUNDLE_WITHOUT="development:test" bundle install` + precompiled assets |
 | **Elixir** | `hexpm/elixir` | `debian-slim` / `alpine` | `mix release` |
 
 Image hygiene:
@@ -144,7 +144,7 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { memory: "512Mi" }                   # memory limit; CPU limits often cause throttling
-          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }   # mount an emptyDir at /tmp if the app writes temp files
           startupProbe:   { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 5, failureThreshold: 30 }
           livenessProbe:  { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 10 }
           readinessProbe: { httpGet: { path: /health/ready, port: 8080 }, periodSeconds: 5 }
@@ -153,7 +153,7 @@ spec:
       terminationGracePeriodSeconds: 30
 ```
 
-Runtime tuning to match container limits: JVM `-XX:MaxRAMPercentage`, Node `--max-old-space-size`, Go `GOMEMLIMIT`/`GOMAXPROCS` (automatic in recent Go versions), .NET server GC settings, worker/process counts for Python/Ruby/PHP servers sized to CPU requests.
+Runtime tuning to match container limits: JVM `-XX:MaxRAMPercentage`, Node `--max-old-space-size`, Go `GOMEMLIMIT` (and `GOMAXPROCS`, which is container-aware by default from Go 1.25), .NET server GC settings, worker/process counts for Python/Ruby/PHP servers sized to CPU requests.
 
 ### Service, Config, Secrets
 

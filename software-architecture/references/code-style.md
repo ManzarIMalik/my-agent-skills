@@ -80,6 +80,13 @@ Additional rules:
 ### Error Taxonomy
 
 ```
+// Input errors — the request itself is malformed or invalid
+error InvalidInput(field?, reason)            -> 400 / 422
+
+// Auth errors — raised by authentication/authorization checks
+error Unauthenticated(reason)                 -> 401
+error Forbidden(reason)                       -> 403
+
 // Domain errors — expected business outcomes
 error DomainError
   NotFound(entityType, entityId)              -> "Order 123 not found"
@@ -107,6 +114,9 @@ getUser(id) -> UserDTO {
 }
 
 // The edge (middleware / global error handler) maps categories to transport responses:
+on InvalidInput         -> 422 (400 if the body couldn't be parsed at all)
+on Unauthenticated      -> 401
+on Forbidden            -> 403
 on NotFound             -> 404
 on RuleViolated         -> 422
 on Conflict             -> 409

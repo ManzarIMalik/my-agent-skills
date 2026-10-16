@@ -206,6 +206,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_orders_status_created ON orders (stat
 DROP INDEX CONCURRENTLY IF EXISTS ix_orders_status_created;
 ```
 
+`CONCURRENTLY` can't run inside a transaction, and many migration tools wrap each migration in one — mark such migrations as non-transactional using the tool's option for that.
+
 Rules for zero-downtime deploys (old and new code run side by side during a rollout):
 1. **Expand → migrate → contract.** Add the new column/table (nullable or with a default) → deploy code that writes both and reads new → backfill in batches → deploy code that only uses new → drop the old column in a later release.
 2. **Never rename or drop in the same release** as the code change that stops using it.

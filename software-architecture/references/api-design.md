@@ -171,13 +171,24 @@ Idempotency-Key: 9f1c6c1e-…
 
 handler(req) {
   key = req.headers["Idempotency-Key"] ?? fail BadRequest("Idempotency-Key required")
-  existing = idempotencyStore.get(key, scope = principal.id)
-  if existing is present:
+  scope = req.principal.id
+
+  // Claim the key atomically (unique constraint / SET NX) so two concurrent retries can't both execute
+  claimed = idempotencyStore.claim(key, scope, requestHash = hash(req.body), ttl = 24 hours)
+  if not claimed:
+    existing = idempotencyStore.get(key, scope)
     if existing.requestHash != hash(req.body): fail Conflict("Key reused with a different request")
-    return existing.response                         // replay the stored response
-  response = processPayment.execute(...)
-  idempotencyStore.put(key, hash(req.body), response, ttl = 24 hours)   // atomically with the effect when possible
-  return response
+    if existing.status == IN_PROGRESS:         fail Conflict("Request with this key is still processing")   // client retries later
+    return existing.response                                                                             // replay
+
+  try {
+    response = processPayment.execute(...)
+    idempotencyStore.complete(key, scope, response)   // ideally in the same transaction as the effect
+    return response
+  } catch error {
+    idempotencyStore.release(key, scope)             // let a retry run again after a failure
+    rethrow error
+  }
 }
 ```
 

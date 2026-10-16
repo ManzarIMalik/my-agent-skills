@@ -88,8 +88,12 @@ class BrokerEventPublisher(producer: BrokerProducer, topicFor: (string) -> strin
 class BrokerEventSubscriber(consumer: BrokerConsumer) implements EventSubscriber {
   subscribe(type, handler, group) {
     consumer.join(group).onMessage(msg -> {
-      handler(toEnvelope(msg))
-      msg.ack()                                // ack only AFTER successful handling
+      try {
+        handler(toEnvelope(msg))
+        msg.ack()                              // ack only AFTER successful handling
+      } catch error {
+        msg.nack()                             // redeliver per retry policy; DLQ after max attempts (see below)
+      }
     })
   }
 }
@@ -137,6 +141,8 @@ loop every 500ms {
 }
 // …which is fine because consumers are idempotent. Purge old published rows periodically.
 ```
+
+The relay is the one place where a network call inside a database transaction is acceptable: the row lock (`FOR UPDATE SKIP LOCKED`) is what lets several relay instances run safely. Keep batches small and broker timeouts short so locks are held briefly. Strict per-aggregate ordering additionally requires a single relay per partition key (or publishing in `created_at` order per aggregate).
 
 Alternatives: change data capture (Debezium reading the database log), or a framework that does this for you (MassTransit, NServiceBus, Axon, Spring Modulith, Wolverine, Oban + Ecto.Multi).
 
@@ -211,7 +217,7 @@ A saga coordinates a business transaction across services using **local transact
 ### Orchestrated saga (persisted state machine)
 
 ```
-enum SagaState { STARTED, INVENTORY_RESERVED, PAYMENT_CAPTURED, COMPLETED, COMPENSATING, FAILED }
+enum SagaState { RUNNING, COMPENSATING, COMPLETED, FAILED }   // per-step progress lives in saga.completedSteps
 
 record SagaStep { name, action: () -> void, compensation: () -> void }
 
@@ -225,6 +231,9 @@ class PlaceOrderSaga(sagaStore, orders, inventory, payments, notifications) {
 
   run(cmd) {
     saga = sagaStore.createOrLoad(cmd.idempotencyKey)       // resumable after a crash
+    if saga.state == COMPLETED: return                      // duplicate request
+    if saga.state in [COMPENSATING, FAILED]:                // crashed mid-compensation, or already failed
+      compensate(saga); fail SagaFailed(saga.id)
     for step in steps(cmd, saga.id) where step.name not in saga.completedSteps:
       try {
         step.action()                                       // each action is idempotent (uses saga.id as key)
@@ -238,8 +247,8 @@ class PlaceOrderSaga(sagaStore, orders, inventory, payments, notifications) {
     notifications.sendOrderConfirmation(saga.id)            // after completion, not a compensable step
   }
 
-  compensate(saga) {
-    for name in reverse(saga.completedSteps):
+  compensate(saga) {                                         // idempotent: skips already-compensated steps
+    for name in reverse(saga.completedSteps) where name not in saga.compensatedSteps:
       retryWithBackoff { step(name).compensation() }        // compensations must eventually succeed
       saga.markCompensated(name); sagaStore.save(saga)
     saga.state = FAILED; sagaStore.save(saga)

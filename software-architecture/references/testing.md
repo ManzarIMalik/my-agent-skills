@@ -49,6 +49,7 @@ describe "Order" {
 
   test "confirm emits OrderConfirmed" {
     order = anOrder().build()
+    order.pullEvents()                         // discard OrderPlaced raised on creation
     order.confirm(fixedClock)
     expect(order.status).toEqual(CONFIRMED)
     expect(order.pullEvents()).toContainOnly(OrderConfirmed(orderId = order.id, ...))

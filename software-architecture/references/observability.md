@@ -90,7 +90,7 @@ middleware metrics(req, next) {
     response = next(req)
     return response
   } finally {
-    labels = { method: req.method, route: req.routeTemplate, status_class: statusClass(response) }  // "2xx", "5xx"
+    labels = { method: req.method, route: req.routeTemplate, status_class: statusClass(response) }  // "2xx", "5xx"; no response (exception) counts as "5xx"
     requests.add(1, labels)
     latency.record(seconds(monotonicNow() - start), labels without status_class)
     inFlight.add(-1)

@@ -46,7 +46,7 @@ All examples in this skill use the same small pseudocode so they read consistent
 ```
 interface UserRepository {          // an abstraction / port (interface, trait, protocol, abstract class)
   getById(id: UserId) -> User?      // `T?` = value may be absent (null, Option, Maybe, nil)
-  save(user: User) -> User
+  save(user: User) -> void
 }
 
 class GetUserUseCase(users: UserRepository) {   // constructor parameters = injected dependencies
@@ -62,6 +62,9 @@ class GetUserUseCase(users: UserRepository) {   // constructor parameters = inje
 - **I/O calls are written as plain calls.** In the target language make them async/non-blocking where that's the norm (`async/await` in TS/C#/Python/Rust/Swift/Dart, coroutines in Kotlin, goroutines in Go, processes in Elixir, virtual threads in modern Java).
 - **`record`** means an immutable data type (record, data class, frozen dataclass, struct with no setters, `readonly` type).
 - **`transaction { ... }`** means a scoped unit of work that commits on success and rolls back on failure (try/finally, `using`, `defer`, `with`, RAII, a closure-based helper).
+- **`a ?? b`** means "`a` if present, otherwise `b`" (`??`, `?:`, `unwrap_or`, `or`, `||`); `a ?? fail X` means "unwrap or signal X".
+- **`match x { … }`** is pattern matching / switch on a value, variant, or error type (`switch`, `when`, `match`, `case`, `try/catch` by type).
+- **`launch { … }`** starts concurrent work tied to the current scope; **`safely { … }`** runs a call and logs-and-ignores its failure (only used where a failure is genuinely non-critical, like a cache write).
 
 ---
 
@@ -184,19 +187,22 @@ error RuleViolated(rule: string, reason: string)
 // …infrastructure code wraps low-level failures…
 error Unavailable(dependency: string, cause: Error)
 
-// …and only the presentation layer maps them to a transport.
+// …and only the presentation layer maps them to a transport — once, centrally.
 handler getItem(request) {
-  result = getItemUseCase.execute(request.path.id)
-  match result {
-    ok(item)              -> respond(200, ItemResponse.from(item))
+  return respond(200, ItemResponse.from(getItemUseCase.execute(request.path.id)))   // happy path only
+}
+
+errorMapper(error) -> Response {            // middleware / exception filter / error handler
+  match error {
     NotFound              -> respond(404, problem("Not found"))
     RuleViolated(r, why)  -> respond(422, problem(why, rule = r))
-    Unavailable           -> respond(503, problem("Service unavailable"))
+    Unavailable           -> log.error(error); respond(503, problem("Service unavailable"))
+    else                  -> log.error(error); respond(500, problem("Internal error"))
   }
 }
 ```
 
-Whether these are exception classes, enum/sum-type variants, sentinel errors, or tagged tuples depends on the language — see [language-adaptation.md](references/language-adaptation.md#errors). Map errors centrally (middleware, exception filter, error handler) rather than in every handler. See [code-style.md](references/code-style.md#error-handling).
+Whether these are exception classes, enum/sum-type variants, sentinel errors, or tagged tuples depends on the language — see [language-adaptation.md](references/language-adaptation.md#errors). In Result-style languages the handler returns the error and a shared function converts it (e.g. `impl IntoResponse` in Axum, a wrapper around Go handlers). See [code-style.md](references/code-style.md#error-handling) for the full taxonomy.
 
 ---
 
@@ -247,15 +253,15 @@ Wrap the repository rather than tangling cache logic into the use case — the u
 ```
 class CachedUserRepository(inner: UserRepository, cache: Cache, ttl: Duration) implements UserRepository {
   getById(id) -> User? {
-    hit = cache.get("user:" + id)
+    hit = cache.get("user:v1:" + id)
     if hit is present: return deserialize(hit)
     user = inner.getById(id)
-    if user is present: cache.set("user:" + id, serialize(user), ttl)
+    if user is present: cache.set("user:v1:" + id, serialize(user), ttl)
     return user
   }
   save(user) {
     inner.save(user)
-    cache.delete("user:" + user.id)   // invalidate after the write succeeds
+    cache.delete("user:v1:" + user.id)   // invalidate after the write succeeds
   }
 }
 ```
@@ -267,15 +273,15 @@ See [caching.md](references/caching.md) for stampede protection, invalidation, a
 Saving and then publishing as two separate steps loses events if the process dies in between. Write the event to an **outbox** table in the same transaction, and relay it afterwards:
 
 ```
-class CreateOrderUseCase(uow: UnitOfWorkFactory) {
+class CreateOrderUseCase(uowFactory: UnitOfWorkFactory, clock: Clock) {
   execute(cmd: CreateOrderCommand) -> OrderDTO {
-    transaction uow as tx {
-      order = Order.create(cmd.customerId, cmd.items)
-      tx.orders.add(order)
-      tx.outbox.add(order.pullEvents())   // same transaction as the state change
-      tx.commit()
+    transaction uowFactory.begin() as uow {
+      order = Order.create(cmd.customerId, cmd.items, clock = clock)   // raises OrderPlaced internally
+      uow.orders.add(order)
+      uow.outbox.add(order.pullEvents())   // same transaction as the state change
+      uow.commit()
+      return OrderDTO.from(order)
     }
-    return OrderDTO.from(order)
   }
 }
 // A separate relay process reads the outbox and publishes to the broker (at-least-once).

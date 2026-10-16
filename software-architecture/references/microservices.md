@@ -132,7 +132,8 @@ class CircuitBreaker(failureThreshold = 5, coolDown = 30 seconds, halfOpenMaxCal
       state = HALF_OPEN
     if state == HALF_OPEN and halfOpenInFlight >= halfOpenMaxCalls: fail CircuitOpen()
 
-    if state == HALF_OPEN: halfOpenInFlight += 1
+    isTrial = (state == HALF_OPEN)                   // remember locally: state may change before `finally`
+    if isTrial: halfOpenInFlight += 1
     try {
       result = operation()
       onSuccess(); return result
@@ -140,7 +141,7 @@ class CircuitBreaker(failureThreshold = 5, coolDown = 30 seconds, halfOpenMaxCal
       if countsAsFailure(error): onFailure()        // don't count 4xx client errors
       rethrow error
     } finally {
-      if state == HALF_OPEN: halfOpenInFlight -= 1
+      if isTrial: halfOpenInFlight -= 1             // otherwise the counter leaks and the breaker never closes
     }
   }
 

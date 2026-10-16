@@ -32,15 +32,15 @@ hashPassword(plain) -> string {
   return Argon2id.hash(plain)              // memory-hard; library chooses salt and encodes parameters
 }
 
-verifyPassword(plain, stored) -> bool {
-  ok = Argon2id.verify(plain, stored)      // constant-time comparison inside the library
-  if ok and Argon2id.needsRehash(stored):  // parameters upgraded since this hash was made
-    scheduleRehash(plain)
+verifyPassword(user, plain) -> bool {
+  ok = Argon2id.verify(plain, user.passwordHash)     // constant-time comparison inside the library
+  if ok and Argon2id.needsRehash(user.passwordHash): // cost parameters raised since this hash was made
+    users.updatePasswordHash(user.id, hashPassword(plain))   // rehash now; never keep the plaintext around
   return ok
 }
 ```
 
-- Use **Argon2id** (preferred), **scrypt**, or **bcrypt** with a sensible cost factor — via the platform's standard library or a well-known package (Spring Security `PasswordEncoder`, ASP.NET Identity, `argon2`/`bcrypt` packages for Node, `argon2-cffi`/`passlib`/`pwdlib` for Python, `golang.org/x/crypto/argon2` or `bcrypt`, the `argon2` crate, PHP `password_hash()`, Rails `has_secure_password`, `argon2_elixir`).
+- Use **Argon2id** (preferred), **scrypt**, or **bcrypt** with a sensible cost factor — via the platform's standard library or a well-known package (Spring Security `PasswordEncoder`, ASP.NET Identity, `argon2`/`bcrypt` packages for Node, `argon2-cffi`/`pwdlib` for Python, `golang.org/x/crypto/argon2` or `bcrypt`, the `argon2` crate, PHP `password_hash()`, Rails `has_secure_password`, `argon2_elixir`).
 - Never use fast hashes (MD5, SHA-*) for passwords. Never log passwords or hashes.
 - Check new passwords against breached-password lists; prefer length (≥ 12) over composition rules.
 

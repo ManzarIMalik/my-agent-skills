@@ -142,7 +142,7 @@ A unit of work groups changes to several repositories into **one transaction**.
 ### Interface
 
 ```
-interface UnitOfWork {
+interface UnitOfWork {             // one per bounded context, exposing the repositories it needs
   users:    UserRepository
   orders:   OrderRepository
   payments: PaymentRepository
@@ -157,12 +157,12 @@ interface UnitOfWorkFactory { begin() -> UnitOfWork }
 
 ```
 class SqlUnitOfWork(conn: DatabaseConnection) implements UnitOfWork {
-  init      { conn.beginTransaction() }
+  init      { conn.beginTransaction(); committed = false }
   users     = SqlUserRepository(conn)      // all repositories share the same connection/transaction
   orders    = SqlOrderRepository(conn)
   payments  = SqlPaymentRepository(conn)
   outbox    = SqlOutboxRepository(conn)
-  commit()   { conn.commit() }
+  commit()   { conn.commit(); committed = true }
   rollback() { conn.rollback() }
   close()    { if not committed: rollback(); conn.release() }   // always runs (finally/defer/Drop/using)
 }
@@ -171,15 +171,15 @@ class SqlUnitOfWork(conn: DatabaseConnection) implements UnitOfWork {
 ### Usage
 
 ```
-class PlaceOrderUseCase(uowFactory: UnitOfWorkFactory) {
+class PlaceOrderUseCase(uowFactory: UnitOfWorkFactory, clock: Clock) {
   execute(cmd: PlaceOrderCommand) -> OrderDTO {
     transaction uowFactory.begin() as uow {
       customer = uow.users.getById(cmd.customerId)
       if customer is none: fail NotFound("User", cmd.customerId)
 
-      order = Order.create(customer.id, cmd.items)
+      order = Order.create(customer.id, cmd.items, clock = clock)
       uow.orders.add(order)
-      uow.payments.add(Payment.pending(order.id, order.total))
+      uow.payments.add(Payment.pending(order.id, order.total()))
       uow.outbox.add(order.pullEvents())   // events committed atomically with state
 
       uow.commit()
@@ -225,7 +225,8 @@ No I/O, no framework — trivially unit-testable. Use exact decimal types for mo
 class OrderApplicationService(
   uowFactory: UnitOfWorkFactory,
   inventory:  InventoryPort,
-  pricing:    PricingService
+  pricing:    PricingService,
+  clock:      Clock
 ) {
   placeOrder(cmd: PlaceOrderCommand) -> OrderDTO {
     for item in cmd.items {
@@ -237,7 +238,7 @@ class OrderApplicationService(
     transaction uowFactory.begin() as uow {
       customer = uow.users.getById(cmd.customerId) ?? fail NotFound("User", cmd.customerId)
       discount = pricing.calculateDiscount(customer, cmd.items, cmd.promoCode)
-      order    = Order.create(customer.id, cmd.items, discount)
+      order    = Order.create(customer.id, cmd.items, discount, clock)
 
       uow.orders.add(order)
       uow.outbox.add(order.pullEvents())   // inventory reservation + confirmation email react to OrderPlaced

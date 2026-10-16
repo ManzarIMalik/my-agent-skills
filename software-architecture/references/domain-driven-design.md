@@ -84,8 +84,8 @@ Value objects are **immutable**, **compared by value**, and **validate themselve
 ```
 record Email(value: string) {
   constructor validate {
-    if not matches(value, EMAIL_PATTERN): fail InvalidInput("Invalid email address: " + value)
-    value = lowercase(trim(value))   // normalise once, here
+    value = lowercase(trim(value))   // normalise first, once, here…
+    if not matches(value, EMAIL_PATTERN): fail InvalidInput("Invalid email address: " + value)   // …then validate
   }
   toString() -> string { return value }
 }
