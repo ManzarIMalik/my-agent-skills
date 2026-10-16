@@ -1,261 +1,225 @@
 # API Design
 
+Transport-level design that applies to any server framework. Pseudocode conventions are in [SKILL.md](../SKILL.md#pseudocode-conventions); framework choices per language are in [language-adaptation.md](language-adaptation.md#ecosystem-toolbox).
+
 ## Table of Contents
 
-1. [FastAPI Router Structure](#fastapi-router-structure)
-2. [Request/Response Schemas](#requestresponse-schemas)
-3. [Dependency Injection Setup](#dependency-injection-setup)
-4. [API Versioning](#api-versioning)
+1. [Choosing a Style](#choosing-a-style)
+2. [Resource and Endpoint Design](#resource-and-endpoint-design)
+3. [Handler Structure](#handler-structure)
+4. [Request/Response Schemas](#requestresponse-schemas)
+5. [Errors](#errors)
+6. [Pagination, Filtering, Sorting](#pagination-filtering-sorting)
+7. [Idempotency and Concurrency](#idempotency-and-concurrency)
+8. [Authentication in Handlers](#authentication-in-handlers)
+9. [API Versioning and Evolution](#api-versioning-and-evolution)
+10. [Contract-First and Documentation](#contract-first-and-documentation)
 
 ---
 
-## FastAPI Router Structure
+## Choosing a Style
 
-```python
-# src/presentation/api/v1/users.py
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+| Style | Good for | Watch out for |
+|---|---|---|
+| **REST/HTTP + JSON** | Public APIs, broad client compatibility, cacheable reads | Chatty clients, over/under-fetching |
+| **gRPC (Protobuf)** | Internal service-to-service, streaming, strict contracts, polyglot codegen | Browser support needs a proxy (gRPC-Web/Connect); harder to debug by hand |
+| **GraphQL** | Many client shapes over the same data (mobile + web), aggregating backends | Query cost control, N+1 in resolvers (use dataloaders), HTTP caching is harder |
+| **Async messaging / webhooks** | Notifications, long-running work, decoupled integrations | Delivery guarantees, ordering, retries — see [event-driven.md](event-driven.md) |
 
-router = APIRouter(prefix="/api/v1/users", tags=["users"])
+---
 
-@router.post(
-    "/",
-    response_model=UserResponse,
-    status_code=status.HTTP_201_CREATED,
-    responses={
-        201: {"description": "User created successfully"},
-        409: {"description": "Email already exists"},
-        422: {"description": "Validation error"}
-    }
-)
-async def create_user(
-    user_data: UserCreate,
-    use_case: CreateUserUseCase = Depends(get_create_user_use_case),
-) -> UserResponse:
-    """
-    Create a new user.
+## Resource and Endpoint Design
 
-    - **email**: Valid email address (unique)
-    - **name**: Full name
-    - **password**: Minimum 8 characters
-    """
-    try:
-        user = await use_case.execute(user_data)
-        return UserResponse.from_dto(user)
-    except EmailAlreadyExistsError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Email {e.email} is already registered"
-        )
-
-@router.get("/{user_id}", response_model=UserResponse)
-async def get_user(
-    user_id: UUID,
-    use_case: GetUserUseCase = Depends(get_get_user_use_case),
-) -> UserResponse:
-    try:
-        user = await use_case.execute(str(user_id))
-        return UserResponse.from_dto(user)
-    except EntityNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User {user_id} not found")
-
-@router.get("/", response_model=PaginatedResponse[UserResponse])
-async def list_users(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    use_case: ListUsersUseCase = Depends(get_list_users_use_case),
-) -> PaginatedResponse[UserResponse]:
-    result = await use_case.execute(page=page, page_size=page_size)
-    return PaginatedResponse(
-        items=[UserResponse.from_dto(u) for u in result.items],
-        total=result.total, page=page, page_size=page_size
-    )
-
-@router.patch("/{user_id}", response_model=UserResponse)
-async def update_user(
-    user_id: UUID,
-    update_data: UserUpdate,
-    use_case: UpdateUserUseCase = Depends(get_update_user_use_case),
-    current_user: User = Depends(get_current_user),
-) -> UserResponse:
-    if str(current_user.id) != str(user_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update other users")
-
-    user = await use_case.execute(str(user_id), update_data)
-    return UserResponse.from_dto(user)
-
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(
-    user_id: UUID,
-    use_case: DeleteUserUseCase = Depends(get_delete_user_use_case),
-    current_user: User = Depends(get_current_user),
-) -> None:
-    if str(current_user.id) != str(user_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete other users")
-    await use_case.execute(str(user_id))
 ```
+POST   /v1/users                 create                 → 201 + Location header
+GET    /v1/users/{id}            fetch one              → 200 | 404
+GET    /v1/users?status=active   list / filter          → 200 (paginated)
+PATCH  /v1/users/{id}            partial update         → 200 | 404 | 409 | 422
+PUT    /v1/users/{id}            full replace           → 200 | 201
+DELETE /v1/users/{id}            delete                 → 204 | 404
+POST   /v1/orders/{id}/confirm   domain action          → 200 | 409 | 422
+GET    /v1/users/{id}/orders     sub-collection         → 200
+```
+
+- **Nouns for resources, HTTP methods for verbs.** For domain actions that aren't CRUD (confirm, cancel, refund), a sub-resource action `POST /orders/{id}/cancel` is clearer than overloading `PATCH`.
+- **Plural, kebab- or lower-case paths**; consistent JSON field casing across the whole API (pick camelCase or snake_case once).
+- **Use status codes precisely**: 400 malformed, 401 not authenticated, 403 not allowed, 404 not found, 409 conflict/state, 422 validation/rule failure, 429 rate limited, 503 dependency down.
+- **Safe and idempotent methods** (`GET`, `PUT`, `DELETE`) must behave so; make `POST` idempotent with keys when retries are likely.
+- **Timestamps in ISO-8601 UTC**, money as decimal strings or integer minor units plus currency — never floats.
+
+---
+
+## Handler Structure
+
+A handler does four things: **parse/validate input → call one use case → map the result → map errors**. No business logic, no SQL.
+
+```
+// presentation/http/user_routes
+routes(createUser: CreateUserUseCase, getUser: GetUserUseCase, listUsers: ListUsersUseCase,
+       updateUser: UpdateUserUseCase, auth: Authenticator) {
+
+  POST "/v1/users" (req) {
+    body = validate(req.body, UserCreateRequest)              // 422 on failure (handled centrally)
+    user = createUser.execute(body.toCommand())               // EmailTaken -> 409 (handled centrally)
+    return respond(201, UserResponse.from(user), headers = { Location: "/v1/users/" + user.id })
+  }
+
+  GET "/v1/users/{id}" (req) {
+    return respond(200, UserResponse.from(getUser.execute(parseUserId(req.path.id))))
+  }
+
+  GET "/v1/users" (req) {
+    page = PageRequest.parse(req.query, defaultSize = 20, maxSize = 100)
+    result = listUsers.execute(page)
+    return respond(200, PageResponse.from(result, UserResponse.from))
+  }
+
+  PATCH "/v1/users/{id}" (req) {
+    principal = auth.require(req)                                   // 401
+    id = parseUserId(req.path.id)
+    if principal.userId != id and not principal.has("users:write"): // 403
+      fail Forbidden("Cannot update other users")
+    user = updateUser.execute(id, validate(req.body, UserUpdateRequest).toCommand())
+    return respond(200, UserResponse.from(user))
+  }
+}
+```
+
+**Where it lives per framework**: controllers (Spring, ASP.NET, NestJS, Laravel, Rails, Phoenix), route handlers (Express/Fastify/Hono, FastAPI, Flask), `http.HandlerFunc` (Go), handler functions with extractors (Axum/Actix). Use the framework's validation and error-mapping hooks rather than hand-rolling them in each handler.
 
 ---
 
 ## Request/Response Schemas
 
-```python
-from pydantic import BaseModel, EmailStr, Field, validator
-from typing import Generic, TypeVar
+Keep transport schemas **separate from domain entities** so the API contract can evolve independently of internals and you never accidentally expose fields like `passwordHash`.
 
-class BaseSchema(BaseModel):
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat(),
-            Decimal: lambda v: str(v)
-        }
-
-# Request schemas
-class UserCreate(BaseSchema):
-    email: EmailStr
-    name: str = Field(..., min_length=1, max_length=100)
-    password: str = Field(..., min_length=8, max_length=100)
-
-    @validator("password")
-    def validate_password(cls, v):
-        if not any(c.isupper() for c in v):
-            raise ValueError("Must contain at least one uppercase letter")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("Must contain at least one digit")
-        return v
-
-class UserUpdate(BaseSchema):
-    name: str | None = Field(None, min_length=1, max_length=100)
-    email: EmailStr | None = None
-
-# Response schemas
-class UserResponse(BaseSchema):
-    id: UUID
-    email: str
-    name: str
-    tier: str
-    is_active: bool
-    created_at: datetime
-
-    @classmethod
-    def from_dto(cls, dto: UserDTO) -> "UserResponse":
-        return cls(
-            id=dto.id, email=dto.email, name=dto.name,
-            tier=dto.tier.value, is_active=dto.is_active, created_at=dto.created_at
-        )
-
-# Pagination
-T = TypeVar("T")
-
-class PaginatedResponse(BaseModel, Generic[T]):
-    items: list[T]
-    total: int
-    page: int
-    page_size: int
-
-    @property
-    def total_pages(self) -> int:
-        return (self.total + self.page_size - 1) // self.page_size
-
-    @property
-    def has_next(self) -> bool:
-        return self.page < self.total_pages
 ```
+record UserCreateRequest {
+  email:    string   (required, format email, max 254)
+  name:     string   (required, 1..100 chars)
+  password: string   (required, 12..128 chars)   // length beats composition rules; check against breached-password lists
+  toCommand() -> CreateUserCommand
+}
+
+record UserUpdateRequest {     // PATCH: every field optional
+  name:  string?  (1..100 chars)
+  email: string?  (format email)
+}
+
+record UserResponse {
+  id: string, email: string, name: string, tier: string, isActive: bool, createdAt: string (ISO-8601 UTC)
+  static from(dto: UserDTO) -> UserResponse
+}
+
+record PageResponse<T> {
+  items: List<T>
+  page: { size: int, nextCursor: string? }        // cursor style
+  // or { number: int, size: int, totalItems: int, totalPages: int }  // offset style
+}
+```
+
+Validation layers:
+1. **Shape validation at the edge** (types, required, lengths, formats) via the framework's validator or a schema library (Bean Validation, FluentValidation, Zod, Pydantic, go-playground/validator, serde + validator, Laravel/Symfony validators, Ecto changesets).
+2. **Business validation in the domain** (value object constructors, aggregate methods).
 
 ---
 
-## Dependency Injection Setup
+## Errors
 
-```python
-# src/presentation/api/dependencies.py
-from functools import lru_cache
+Use one consistent error envelope across the API. [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457) is a good default:
 
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_maker() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
-def get_user_repository(session: AsyncSession = Depends(get_db_session)) -> UserRepository:
-    return PostgresUserRepository(session)
-
-def get_cache_service(settings: Settings = Depends(get_settings)) -> CacheService:
-    return RedisCacheService(settings.redis_url)
-
-def get_create_user_use_case(
-    user_repo: UserRepository = Depends(get_user_repository),
-    cache: CacheService = Depends(get_cache_service),
-    event_bus: EventBus = Depends(get_event_bus),
-) -> CreateUserUseCase:
-    return CreateUserUseCase(user_repo=user_repo, cache=cache, event_bus=event_bus)
-
-# Authentication
-security = HTTPBearer()
-
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    user_repo: UserRepository = Depends(get_user_repository),
-) -> User:
-    try:
-        payload = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=["HS256"])
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    user = await user_repo.get_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    return user
-
-# Role-based access
-def require_role(required_role: str):
-    async def role_checker(current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role != required_role:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Requires {required_role} role")
-        return current_user
-    return role_checker
 ```
+HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/problems/validation",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "One or more fields are invalid.",
+  "instance": "/v1/users",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "errors": [ { "field": "email", "message": "must be a valid email" } ]
+}
+```
+
+Map domain/infrastructure errors to this format in **one central place** (middleware, exception filter, error handler). Never return stack traces or internal messages to clients; log them with the trace ID instead.
 
 ---
 
-## API Versioning
+## Pagination, Filtering, Sorting
 
-```python
-# URL versioning (recommended)
-from fastapi import APIRouter
+| Approach | Pros | Cons |
+|---|---|---|
+| **Cursor / keyset** (`?after=<opaque cursor>&limit=20`) | Stable under inserts, fast on large tables (uses an index) | No "jump to page 37" |
+| **Offset** (`?page=3&size=20`) | Simple, supports page numbers | Slow for deep pages, rows shift on insert |
 
-v1_router = APIRouter(prefix="/api/v1")
-v1_router.include_router(users_router)
-v1_router.include_router(orders_router)
+- Always enforce a **maximum page size**.
+- Make cursors **opaque** (encode the sort key + ID).
+- Whitelist filter and sort fields; never pass them raw into a query.
+- `GET /v1/orders?status=pending&sort=-createdAt&limit=50`
 
-v2_router = APIRouter(prefix="/api/v2")
-v2_router.include_router(users_router_v2)
+---
 
-# main.py
-app = FastAPI()
-app.include_router(v1_router)
-app.include_router(v2_router)
+## Idempotency and Concurrency
 
-# Header versioning (alternative)
-async def get_api_version(
-    api_version: str = Header(default="1", alias="X-API-Version")
-) -> str:
-    if api_version not in ["1", "2"]:
-        raise HTTPException(status_code=400, detail="Unsupported API version")
-    return api_version
+**Idempotency keys** make retries of non-idempotent operations safe (payments, order creation):
 
-# Deprecation
-@router.get("/old-endpoint")
-@deprecated(version="2.0.0", reason="Use /api/v2/new-endpoint", sunset_date="2024-12-31")
-async def old_endpoint():
-    return {"message": "This endpoint is deprecated"}
 ```
+POST /v1/payments
+Idempotency-Key: 9f1c6c1e-…
+
+handler(req) {
+  key = req.headers["Idempotency-Key"] ?? fail BadRequest("Idempotency-Key required")
+  existing = idempotencyStore.get(key, scope = principal.id)
+  if existing is present:
+    if existing.requestHash != hash(req.body): fail Conflict("Key reused with a different request")
+    return existing.response                         // replay the stored response
+  response = processPayment.execute(...)
+  idempotencyStore.put(key, hash(req.body), response, ttl = 24 hours)   // atomically with the effect when possible
+  return response
+}
+```
+
+**Optimistic concurrency** prevents lost updates: return an `ETag` (or `version`) on reads, require `If-Match` on writes, respond `412 Precondition Failed` (or `409`) on mismatch.
+
+---
+
+## Authentication in Handlers
+
+Authenticate in middleware/filters, expose the **principal** to handlers, and authorise close to the operation:
+
+```
+middleware authenticate(req, next) {
+  token = bearerToken(req.headers.Authorization) ?? return respond(401)
+  claims = tokenVerifier.verify(token)   // signature, issuer, audience, expiry; fails -> 401
+  req.principal = Principal(userId = claims.sub, roles = claims.roles, scopes = claims.scope)
+  return next(req)
+}
+
+requireScope(scope) = middleware (req, next) {
+  if scope not in req.principal.scopes: return respond(403)
+  return next(req)
+}
+```
+
+Object-level checks ("can this user see *this* order?") belong in the use case or a policy object, not only in route-level middleware — see [security.md](security.md#authorization).
+
+---
+
+## API Versioning and Evolution
+
+- **Prefer additive, backward-compatible change**: add optional fields and new endpoints; never rename or remove fields, change types, or tighten validation in place.
+- **Clients must ignore unknown fields** (tolerant reader).
+- **Version when you must break**: URL path (`/v2/…`) is the most visible and cache-friendly; header or media-type versioning (`Accept: application/vnd.example.v2+json`) keeps URLs stable.
+- **Deprecate deliberately**: announce, add `Deprecation` and `Sunset` headers (RFC 9745 / RFC 8594) with a link to migration docs, monitor usage, then remove.
+- **gRPC/Protobuf**: never reuse or renumber field tags; mark removed fields `reserved`.
+- **GraphQL**: evolve continuously with `@deprecated(reason: …)` instead of versions.
+
+---
+
+## Contract-First and Documentation
+
+- Describe the API in a machine-readable contract — **OpenAPI** for HTTP, **.proto** for gRPC, **SDL** for GraphQL, **AsyncAPI** for events — and keep it in the repo.
+- Either generate server stubs/clients from the contract, or generate the contract from code annotations; either way, **check it in CI** (lint it, diff it for breaking changes, run contract tests).
+- Publish interactive docs (Swagger UI, Redoc, Scalar, GraphiQL) and examples for every endpoint.

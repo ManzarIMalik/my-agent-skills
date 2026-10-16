@@ -2,77 +2,76 @@
 
 ## Table of Contents
 
-1. [Monolithic Application](#monolithic-application)
-2. [Microservices Structure](#microservices-structure)
-3. [When to Use Each](#when-to-use-each)
+1. [Guiding Ideas](#guiding-ideas)
+2. [Layered Modular Monolith](#layered-modular-monolith)
+3. [Language-Specific Layout Notes](#language-specific-layout-notes)
+4. [Microservices Structure](#microservices-structure)
+5. [When to Use Each](#when-to-use-each)
+6. [Developer Environment](#developer-environment)
 
 ---
 
-## Monolithic Application
+## Guiding Ideas
+
+- **Organise by business capability first, technical layer second.** `orders/domain`, `orders/application` scale better than one giant `domain/` folder shared by every feature. Each module (bounded context) owns its data and exposes a narrow public API to other modules.
+- **Make boundaries enforceable**, not just conventional: separate packages/modules/projects/crates with explicit visibility, plus an architecture-test or lint rule where the ecosystem supports it (ArchUnit, NetArchTest, dependency-cruiser, `import-linter`, Go `internal/`, Rust crate privacy, Deptrac for PHP, Packwerk for Rails, Elixir `boundary`).
+- **Follow the ecosystem's conventional layout** — newcomers should find things where they expect them.
+
+---
+
+## Layered Modular Monolith
+
+A language-neutral template. Rename folders to the ecosystem's conventions (see below).
 
 ```
 project/
-├── src/
-│   └── <domain>/
-│       ├── __init__.py
-│       ├── domain/                    # Core business logic
-│       │   ├── entities/              # Business entities
-│       │   ├── value_objects/         # Immutable domain values
-│       │   ├── events/                # Domain events
-│       │   ├── services/              # Domain services
-│       │   └── exceptions/            # Domain-specific exceptions
-│       ├── application/               # Use cases & orchestration
-│       │   ├── use_cases/             # Application use cases
-│       │   ├── interfaces/            # Abstract repositories, ports
-│       │   ├── dtos/                  # Data transfer objects
-│       │   └── services/              # Application services
-│       ├── infrastructure/            # External implementations
-│       │   ├── database/
-│       │   │   ├── models/            # ORM models
-│       │   │   ├── repositories/      # Concrete repository implementations
-│       │   │   └── migrations/        # Alembic migrations
-│       │   ├── cache/                 # Redis, in-memory cache
-│       │   ├── messaging/             # RabbitMQ, Kafka adapters
-│       │   ├── external_apis/         # Third-party API clients
-│       │   └── storage/               # S3, file storage
-│       └── presentation/              # External interfaces
-│           ├── api/
-│           │   ├── v1/                # Versioned API routes
-│           │   ├── v2/
-│           │   ├── dependencies.py    # DI factory functions
-│           │   └── middleware/        # Custom middleware
-│           ├── grpc/                  # gRPC services
-│           ├── cli/                   # CLI commands
-│           └── schemas/               # Pydantic request/response models
-├── tests/
-│   ├── unit/                          # Fast, isolated tests
-│   ├── integration/                   # Tests with real dependencies
-│   ├── e2e/                           # End-to-end API tests
-│   ├── performance/                   # Load tests
-│   ├── fixtures/                      # Shared test fixtures
-│   └── conftest.py
-├── deployment/
-│   ├── docker/
-│   │   ├── Dockerfile
-│   │   └── docker-compose.yml
-│   ├── kubernetes/
-│   │   ├── deployment.yaml
-│   │   ├── service.yaml
-│   │   └── configmap.yaml
-│   └── terraform/                     # Infrastructure as code
+├── src/                                   # or app/, lib/, internal/, cmd/ + pkg/, Sources/ …
+│   ├── <module-a>/                        # one bounded context, e.g. orders
+│   │   ├── domain/                        # entities, value objects, domain events, domain services, domain errors
+│   │   ├── application/                   # use cases, commands/queries, DTOs, ports (interfaces)
+│   │   ├── infrastructure/                # adapters: repositories, ORM mappings, cache, messaging, external API clients
+│   │   └── interface/                     # HTTP/gRPC/GraphQL handlers, CLI commands, message consumers, request/response schemas
+│   ├── <module-b>/
+│   ├── shared/                            # truly shared kernel only: IDs, Money, clock, base errors (keep it small)
+│   └── bootstrap/                         # composition root: config loading, DI wiring, server startup
+├── migrations/                            # versioned schema migrations
+├── tests/                                 # or co-located tests, per ecosystem convention
+│   ├── unit/
+│   ├── integration/
+│   ├── contract/
+│   ├── e2e/
+│   └── performance/
+├── deploy/                                # Dockerfile, compose, Kubernetes/Helm, Terraform/Pulumi
 ├── docs/
-│   ├── api/                           # OpenAPI specs
-│   ├── architecture/                  # Architecture decision records
-│   └── runbooks/                      # Operational guides
-├── scripts/
-│   ├── seed_data.py
-│   ├── migrate.py
-│   └── performance_test.py
-├── pyproject.toml
-├── poetry.lock
-├── .env.example
-└── alembic.ini
+│   ├── adr/                               # architecture decision records
+│   ├── api/                               # OpenAPI / protobuf / GraphQL schema
+│   └── runbooks/
+├── scripts/                               # dev/CI helper scripts
+├── <build manifest + lockfile>            # package.json+lock, go.mod+go.sum, Cargo.toml+Cargo.lock, pom.xml, …
+├── .env.example                           # documented config, never real secrets
+└── README.md                              # how to run, test, and deploy
 ```
+
+**Dependency rule inside each module:** `interface → application → domain`, and `infrastructure → application/domain` (implementing ports). Nothing depends on `interface` or `infrastructure` except `bootstrap`.
+
+**Cross-module rule:** module A calls module B only through B's public application API (or B's events) — never B's repositories or tables.
+
+---
+
+## Language-Specific Layout Notes
+
+| Ecosystem | Conventional shape | Notes |
+|---|---|---|
+| **Go** | `cmd/<app>/main.go`, `internal/<module>/…` | Package by feature (`internal/order`, `internal/billing`); keep layers as files or sub-packages only when they grow. `internal/` enforces privacy. |
+| **Rust** | Cargo workspace: `crates/domain`, `crates/app`, `crates/infra`, `crates/api`, binary crate wires them | Crate boundaries enforce the dependency rule at compile time. |
+| **Java / Kotlin** | Maven/Gradle multi-module or one module with packages `com.acme.orders.{domain,application,infrastructure,web}` | Spring Modulith or ArchUnit to enforce boundaries. |
+| **C# / .NET** | Solution with projects `Orders.Domain`, `Orders.Application`, `Orders.Infrastructure`, `Orders.Api` | Project references enforce direction; `internal` + `InternalsVisibleTo` for tests. |
+| **TypeScript / Node** | `src/modules/<module>/{domain,application,infrastructure,http}` or a monorepo (pnpm/Nx/Turborepo) with packages | Use path aliases and dependency-cruiser/eslint boundaries rules. |
+| **Python** | `src/<package>/<module>/{domain,application,infrastructure,api}` with `pyproject.toml` | `import-linter` contracts enforce layering. |
+| **PHP** | Laravel/Symfony default under `app/` or `src/`, with `src/<Module>/{Domain,Application,Infrastructure,Http}` for complex domains | Deptrac for layer rules. |
+| **Ruby / Rails** | Rails defaults (`app/models`, `app/controllers`) plus `app/services` or `app/domain`; engines or Packwerk packs for modules | Don't fight Rails for simple apps. |
+| **Elixir / Phoenix** | Contexts in `lib/my_app/<context>.ex` (public API) with internals in `lib/my_app/<context>/`; web layer in `lib/my_app_web/` | Contexts *are* the module boundaries. |
+| **Swift / Kotlin / Dart apps** | Feature modules (SPM packages, Gradle modules, Dart packages) | See [client-applications.md](client-applications.md). |
 
 ---
 
@@ -81,121 +80,55 @@ project/
 ```
 services/
 ├── user-service/
-│   ├── src/
+│   ├── src/                       # same internal layering as the monolith module
 │   ├── tests/
 │   ├── Dockerfile
-│   └── pyproject.toml
+│   └── <build manifest>
 ├── order-service/
 ├── payment-service/
 ├── notification-service/
-├── shared/                            # Shared libraries
-│   ├── common/
-│   │   ├── events/                    # Event schemas
-│   │   ├── exceptions/
-│   │   └── utils/
-│   └── proto/                         # gRPC proto files
-├── api-gateway/                       # Kong, Traefik, or custom
-└── docker-compose.yml
+├── contracts/                     # schemas shared *by contract*, not by code
+│   ├── events/                    # JSON Schema / Avro / Protobuf event definitions
+│   ├── proto/                     # gRPC service definitions
+│   └── openapi/                   # HTTP API specs
+├── gateway/                       # API gateway / BFF config (Kong, Envoy, Traefik, cloud gateway, or custom)
+└── compose.yaml                   # local stack
 ```
+
+Services can be written in different languages; that's why shared things live as **schemas** that each service generates code from, not as a shared code library. A shared library is acceptable for genuinely cross-cutting, slow-changing concerns (logging setup, tracing middleware) within one language — but treat changes to it as breaking changes for every consumer.
 
 ---
 
 ## When to Use Each
 
-| Approach          | Best For                                                | Trade-offs                                                           |
-| ----------------- | ------------------------------------------------------- | -------------------------------------------------------------------- |
-| **Monolith**      | Early-stage projects, small teams, simple domains       | Easier to develop, deploy, debug. Can become unwieldy at scale.      |
-| **Microservices** | Large teams, complex domains, independent scaling needs | Better scalability and team autonomy. Higher operational complexity. |
+| Approach | Best For | Trade-offs |
+|---|---|---|
+| **Modular monolith** | Most new products, small-to-medium teams, domains still being discovered | One deployable, simple ops, easy refactoring across modules. Needs discipline to keep module boundaries clean. |
+| **Microservices** | Many teams needing independent deploys, parts with very different scaling or reliability needs, established domain boundaries | Independent scaling and ownership. Pays for it with network failures, distributed data, eventual consistency, and much heavier operations. |
+| **Serverless functions** | Spiky/event-driven workloads, glue code, low-traffic APIs | Minimal ops, pay-per-use. Cold starts, vendor coupling, harder local testing. The same layering applies inside each function. |
 
-**Start monolithic, extract services when clearly beneficial.**
+**Start with a modular monolith; extract a service when a module has a clear, independent reason to be separate.** A clean module boundary makes later extraction cheap; a distributed monolith is the worst of both worlds.
 
 ---
 
-## Development Environment Setup
+## Developer Environment
 
-### Using uv (Recommended)
+Whatever the language, a new contributor should be able to go from clone to running tests with one or two documented commands.
 
-[uv](https://docs.astral.sh/uv/) is an extremely fast Python package manager written in Rust.
+- **Pin the toolchain**: `.tool-versions` (asdf/mise), `.nvmrc`, `rust-toolchain.toml`, `go.mod`'s `go`/`toolchain` directive, `global.json`, `.python-version`, Gradle/Maven wrapper.
+- **Commit the lockfile** for applications.
+- **Use the ecosystem's standard tooling**: e.g. npm/pnpm, Go modules, Cargo, Maven/Gradle, `dotnet`, uv/Poetry, Composer, Bundler, Mix, SwiftPM.
+- **Provide a task runner** (`Makefile`, `justfile`, `package.json` scripts, `mise` tasks, Gradle tasks) with consistent verbs: `setup`, `dev`, `test`, `lint`, `fmt`, `migrate`.
+- **Run dependencies locally with containers** (`compose.yaml`) or a dev container so everyone has the same database/cache/broker versions.
+- **Formatter + linter in CI**, configured once (Prettier/ESLint/Biome, gofmt/golangci-lint, rustfmt/clippy, ktlint/detekt/Spotless, `dotnet format`, Ruff, PHP-CS-Fixer/PHPStan, RuboCop, `mix format`/Credo, SwiftLint).
 
-```bash
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create virtual environment
-uv venv .venv
-
-# Activate virtual environment
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
-
-# Install dependencies from pyproject.toml
-uv pip install -e ".[dev]"
-
-# Or install from requirements.txt
-uv pip install -r requirements.txt
-
-# Add a package
-uv pip install fastapi
-
-# Sync dependencies (install exact versions from lock file)
-uv pip sync requirements.txt
 ```
-
-### Project Configuration with uv
-
-```toml
-# pyproject.toml
-[project]
-name = "my-project"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = [
-    "fastapi>=0.109.0",
-    "uvicorn>=0.27.0",
-    "sqlalchemy>=2.0.0",
-    "pydantic>=2.5.0",
-    "redis>=5.0.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "ruff>=0.1.0",
-    "mypy>=1.8.0",
-]
-
-[tool.uv]
-dev-dependencies = [
-    "pytest>=7.4.0",
-    "ruff>=0.1.0",
-]
-```
-
-### Quick Start Script
-
-```bash
-#!/bin/bash
-# scripts/setup.sh
-
+# Example setup script (shell) — adapt the commands to the stack
 set -e
-
-# Check if uv is installed
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-
-# Create and activate venv
-uv venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-uv pip install -e ".[dev]"
-
-# Run migrations
-alembic upgrade head
-
-echo "✅ Development environment ready!"
+<install toolchain from pinned version file>
+<install dependencies from lockfile>
+docker compose up -d db cache
+<run migrations>
+<run test suite>
+echo "Development environment ready"
 ```

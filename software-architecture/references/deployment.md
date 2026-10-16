@@ -1,125 +1,114 @@
 # Production Deployment
 
+Containers and Kubernetes are used as the reference platform because they're language-neutral; the principles carry over to PaaS (Fly.io, Render, Heroku, Cloud Run, App Service, Elastic Beanstalk), serverless, and VMs.
+
 ## Table of Contents
 
-1. [Docker Configuration](#docker-configuration)
-2. [Kubernetes Deployment](#kubernetes-deployment)
-3. [Configuration Management](#configuration-management)
-4. [Production Checklist](#production-checklist)
+1. [Build Principles](#build-principles)
+2. [Container Images](#container-images)
+3. [Local Stack with Compose](#local-stack-with-compose)
+4. [Kubernetes Deployment](#kubernetes-deployment)
+5. [Configuration Management](#configuration-management)
+6. [Graceful Shutdown](#graceful-shutdown)
+7. [Release Strategies](#release-strategies)
+8. [Production Checklist](#production-checklist)
 
 ---
 
-## Docker Configuration
+## Build Principles
 
-### Multi-Stage Dockerfile
+- **Build once, deploy everywhere**: one immutable artifact (image) promoted through environments; only configuration differs ([twelve-factor](https://12factor.net/)).
+- **Reproducible builds**: pinned toolchain, lockfile, pinned base image digests, CI-only builds.
+- **CI pipeline**: format/lint → unit tests → build → integration/contract tests → security scans → image publish (tagged with git SHA) → deploy to staging → smoke tests → promote to production.
+
+---
+
+## Container Images
+
+### Multi-stage Dockerfile (template)
 
 ```dockerfile
-# Build stage
-FROM python:3.11-slim as builder
+# ---- Build stage: full toolchain ----
+FROM <language-sdk-image>:<pinned-version> AS build
+WORKDIR /src
 
+# 1. Copy only dependency manifests first so this layer is cached between code changes
+COPY <manifest> <lockfile> ./
+RUN <install/download dependencies>
+
+# 2. Copy source and build
+COPY . .
+RUN <build / compile / bundle for production>
+
+# ---- Runtime stage: minimal image ----
+FROM <minimal-runtime-image>:<pinned-version> AS runtime
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Run as a non-root user
+RUN <create non-root user "app">          # many minimal/distroless images ship a nonroot user already
+COPY --from=build --chown=app:app <build output> ./
+USER app
 
-# Install Python dependencies
-COPY pyproject.toml poetry.lock ./
-RUN pip install poetry && \
-    poetry config virtualenvs.create false && \
-    poetry install --no-dev --no-interaction --no-ansi
-
-# Production stage
-FROM python:3.11-slim as production
-
-WORKDIR /app
-
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
-
-# Copy dependencies from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copy application code
-COPY src/ ./src/
-COPY alembic/ ./alembic/
-COPY alembic.ini ./
-
-# Set ownership
-RUN chown -R appuser:appuser /app
-
-USER appuser
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health/live || exit 1
-
-EXPOSE 8000
-
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8080
+# Exec form so the process is PID 1 and receives SIGTERM directly
+ENTRYPOINT ["<start command>"]
 ```
 
-### Docker Compose
+| Stack | Build image | Runtime image | Build output |
+|---|---|---|---|
+| **Go** | `golang` | `gcr.io/distroless/static` or `scratch` (with `CGO_ENABLED=0`) | single static binary |
+| **Rust** | `rust` | `distroless/cc` or `debian-slim` (`musl` target for `scratch`) | single binary |
+| **Java / Kotlin** | `eclipse-temurin:<v>-jdk` (+ Maven/Gradle) | `eclipse-temurin:<v>-jre` or distroless Java; or GraalVM native image | fat JAR / layered JAR / native binary |
+| **C# / .NET** | `mcr.microsoft.com/dotnet/sdk` | `mcr.microsoft.com/dotnet/aspnet` (or `runtime-deps` for self-contained / chiseled images) | `dotnet publish` output |
+| **Node / TypeScript** | `node:<lts>` | `node:<lts>-slim` or distroless Node | compiled JS + production `node_modules` only |
+| **Python** | `python:<v>` (+ uv/Poetry) | `python:<v>-slim` | virtualenv copied from build stage + source |
+| **PHP** | `composer` + `php:<v>-cli` | `php:<v>-fpm` (+ nginx) or FrankenPHP | `vendor/` (no dev deps) + source, OPcache enabled |
+| **Ruby** | `ruby:<v>` | `ruby:<v>-slim` | `bundle install --without development test` + precompiled assets |
+| **Elixir** | `hexpm/elixir` | `debian-slim` / `alpine` | `mix release` |
+
+Image hygiene:
+- `.dockerignore` excludes `.git`, local env files, build caches, tests, `node_modules`, etc.
+- No secrets in images or build args; use BuildKit secret mounts if the build needs credentials.
+- Scan images (Trivy, Grype) in CI; rebuild regularly to pick up base-image patches.
+- Let the platform do health checks (Kubernetes probes) — a Dockerfile `HEALTHCHECK` is only useful for plain Docker/Compose, and needs a binary (curl/wget) that minimal images may not contain.
+
+---
+
+## Local Stack with Compose
 
 ```yaml
-version: "3.8"
-
+# compose.yaml
 services:
   api:
-    build:
-      context: .
-      target: production
-    ports:
-      - "8000:8000"
+    build: { context: ., target: runtime }
+    ports: ["8080:8080"]
     environment:
-      - DATABASE_URL=postgresql+asyncpg://user:pass@postgres:5432/app
-      - REDIS_URL=redis://redis:6379/0
-      - RABBITMQ_URL=amqp://user:pass@rabbitmq:5672/
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      REDIS_URL: redis://redis:6379/0
+      BROKER_URL: amqp://app:app@rabbitmq:5672/
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    deploy:
-      replicas: 2
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
 
   postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pass
-      POSTGRES_DB: app
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d app"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    image: postgres:16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app }
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U app -d app"], interval: 5s, timeout: 5s, retries: 5 }
 
   redis:
     image: redis:7-alpine
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 5s, retries: 5 }
 
   rabbitmq:
     image: rabbitmq:3-management
-    environment:
-      RABBITMQ_DEFAULT_USER: user
-      RABBITMQ_DEFAULT_PASS: pass
+    environment: { RABBITMQ_DEFAULT_USER: app, RABBITMQ_DEFAULT_PASS: app }
 
 volumes:
   postgres_data:
 ```
+
+Credentials here are for local development only.
 
 ---
 
@@ -132,261 +121,195 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: api
-  labels:
-    app: api
+  labels: { app: api }
 spec:
   replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
   selector:
-    matchLabels:
-      app: api
+    matchLabels: { app: api }
   template:
     metadata:
-      labels:
-        app: api
+      labels: { app: api }
     spec:
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: api
-          image: myregistry/api:v1.0.0
-          ports:
-            - containerPort: 8000
+          image: registry.example.com/api:3f2c9ab          # immutable tag (git SHA) or digest
+          ports: [{ containerPort: 8080 }]
           envFrom:
-            - configMapRef:
-                name: api-config
-            - secretRef:
-                name: api-secrets
+            - configMapRef: { name: api-config }
+            - secretRef:    { name: api-secrets }
           resources:
-            requests:
-              memory: "256Mi"
-              cpu: "250m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-          livenessProbe:
-            httpGet:
-              path: /health/live
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /health/ready
-              port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 5
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { memory: "512Mi" }                   # memory limit; CPU limits often cause throttling
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          startupProbe:   { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 5, failureThreshold: 30 }
+          livenessProbe:  { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 10 }
+          readinessProbe: { httpGet: { path: /health/ready, port: 8080 }, periodSeconds: 5 }
           lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 10"]
+            preStop: { sleep: { seconds: 5 } }              # let endpoints update before SIGTERM handling (k8s ≥ 1.30; else exec sleep)
       terminationGracePeriodSeconds: 30
 ```
 
-### Service
+Runtime tuning to match container limits: JVM `-XX:MaxRAMPercentage`, Node `--max-old-space-size`, Go `GOMEMLIMIT`/`GOMAXPROCS` (automatic in recent Go versions), .NET server GC settings, worker/process counts for Python/Ruby/PHP servers sized to CPU requests.
+
+### Service, Config, Secrets
 
 ```yaml
 apiVersion: v1
 kind: Service
-metadata:
-  name: api
+metadata: { name: api }
 spec:
-  selector:
-    app: api
-  ports:
-    - port: 80
-      targetPort: 8000
-  type: ClusterIP
-```
-
-### ConfigMap & Secret
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: api-config
-data:
-  LOG_LEVEL: "INFO"
-  ENVIRONMENT: "production"
-  WORKERS: "4"
+  selector: { app: api }
+  ports: [{ port: 80, targetPort: 8080 }]
 ---
 apiVersion: v1
-kind: Secret
-metadata:
-  name: api-secrets
-type: Opaque
-stringData:
-  DATABASE_URL: "postgresql+asyncpg://user:pass@postgres:5432/app"
-  JWT_SECRET: "your-secret-key"
+kind: ConfigMap
+metadata: { name: api-config }
+data:
+  LOG_LEVEL: "info"
+  ENVIRONMENT: "production"
+# Secrets: create from a secret manager (External Secrets Operator, Sealed Secrets, CSI driver) —
+# never commit real secret values to manifests.
 ```
 
-### Horizontal Pod Autoscaler
+### Autoscaling and Availability
 
 ```yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
-metadata:
-  name: api-hpa
+metadata: { name: api }
 spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
   minReplicas: 3
   maxReplicas: 10
   metrics:
     - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api }
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app: api } }
 ```
+
+Scale queue consumers on queue depth/lag (KEDA) rather than CPU. Package manifests with Helm or Kustomize and deploy via GitOps (Argo CD, Flux) or your CD pipeline. Run migrations as a separate Job/pipeline step before rolling out new pods, following expand/contract (see [database-patterns.md](database-patterns.md#migrations)).
 
 ---
 
 ## Configuration Management
 
-```python
-from pydantic_settings import BaseSettings
-from functools import lru_cache
+Configuration comes from the **environment** (env vars, mounted files, secret manager), is **validated at startup**, and is exposed to the app as one **typed object** injected where needed — never read ad hoc from `env` throughout the codebase.
 
-class Settings(BaseSettings):
-    # Application
-    app_name: str = "My API"
-    environment: str = "development"
-    debug: bool = False
-    version: str = "1.0.0"
-
-    # Server
-    host: str = "0.0.0.0"
-    port: int = 8000
-    workers: int = 4
-
-    # Database
-    database_url: str
-    db_pool_size: int = 20
-    db_max_overflow: int = 10
-
-    # Redis
-    redis_url: str
-    cache_ttl: int = 300
-
-    # RabbitMQ
-    rabbitmq_url: str
-
-    # Security
-    jwt_secret: str
-    jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 30
-
-    # External Services
-    user_service_url: str = ""
-    payment_service_url: str = ""
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-# Environment-specific configs
-class DevelopmentSettings(Settings):
-    debug: bool = True
-    log_level: str = "DEBUG"
-
-class ProductionSettings(Settings):
-    debug: bool = False
-    log_level: str = "INFO"
-    workers: int = 8
-
-def get_settings_for_environment() -> Settings:
-    env = os.getenv("ENVIRONMENT", "development")
-    if env == "production":
-        return ProductionSettings()
-    return DevelopmentSettings()
 ```
+record Settings {
+  environment:        "development" | "staging" | "production"
+  port:               int            = 8080
+  logLevel:           string         = "info"
+  databaseUrl:        Secret<string>                 // required, never logged
+  dbPoolSize:         int            = 10
+  redisUrl:           string
+  cacheTtl:           Duration       = 5 minutes
+  brokerUrl:          Secret<string>
+  oidcIssuer:         Url
+  apiAudience:        string
+  userServiceUrl:     Url
+  requestTimeout:     Duration       = 2 seconds
+}
+
+loadSettings() -> Settings {
+  settings = parse(Settings, from = [defaults, configFile(optional), environmentVariables])
+  validate(settings)               // fail fast with a clear message listing every missing/invalid key
+  return settings
+}
+```
+
+Language tools: Spring `@ConfigurationProperties`, .NET Options pattern (`IOptions<T>` + validation), Zod/`envalid` over `process.env`, `pydantic-settings`, Go `envconfig`/`koanf`/`viper`, Rust `config`/`figment`/`envy`, Laravel `config/` + `.env`, Rails credentials + ENV, Elixir `runtime.exs`.
+
+- Same code path in every environment; differences are config values, not `if env == "prod"` branches scattered in code.
+- Feature flags (OpenFeature-compatible providers, LaunchDarkly, Unleash, Flagsmith) for runtime toggles, not config redeploys.
+
+---
+
+## Graceful Shutdown
+
+On `SIGTERM` (or the platform's equivalent):
+
+```
+onSignal(SIGTERM, SIGINT) {
+  log.info("shutdown started")
+  readiness.markNotReady()                // load balancer stops sending new traffic
+  sleep(preStopDelay)                     // optional: allow endpoint propagation
+  httpServer.stopAccepting()
+  httpServer.awaitInFlight(timeout = 20 seconds)
+  consumers.stopFetching(); consumers.awaitInFlight(timeout = 20 seconds)   // finish & ack current messages
+  backgroundJobs.drain()
+  outboxRelay.stop()
+  broker.close(); cache.close(); dbPool.close()
+  telemetry.flush()                       // don't lose the last spans/metrics/logs
+  log.info("shutdown complete")
+  exit(0)
+}
+```
+
+- The total must fit inside the platform's grace period (`terminationGracePeriodSeconds`).
+- Ensure the app process is PID 1 or uses a minimal init (`tini`, `dumb-init`) so signals arrive.
+- Most frameworks have hooks for this (Spring graceful shutdown, `IHostApplicationLifetime`, Node `server.close()` + signal handlers, Uvicorn/Gunicorn graceful timeout, Go `http.Server.Shutdown(ctx)`, Axum `with_graceful_shutdown`, Puma/Sidekiq quiet+stop, OTP application stop callbacks).
+
+---
+
+## Release Strategies
+
+| Strategy | How | Good for |
+|---|---|---|
+| **Rolling** | Replace instances gradually | Default; requires backward-compatible changes |
+| **Blue/green** | Two full environments; switch traffic | Fast rollback; costs double capacity briefly |
+| **Canary** | Small % of traffic to the new version, watch metrics, then ramp | High-risk changes; needs good observability (Argo Rollouts, Flagger, service mesh) |
+| **Feature flags** | Deploy dark, release by toggling | Decoupling deploy from release; gradual rollout per user segment |
+
+Always have a **tested rollback path** — and remember database migrations must be compatible with the previous version for rollback to work.
 
 ---
 
 ## Production Checklist
 
 ### Pre-Deployment
-
-- [ ] All tests passing (unit, integration, E2E)
-- [ ] Security scan completed (dependencies, SAST)
-- [ ] Database migrations tested
-- [ ] Environment variables configured
-- [ ] Secrets rotated and secured
-- [ ] Resource limits set (CPU, memory)
-- [ ] Health checks configured
+- [ ] All tests passing (unit, integration, contract, E2E smoke)
+- [ ] Dependency, image, and SAST scans clean or triaged
+- [ ] Migrations tested against production-like data; backward compatible
+- [ ] Configuration validated; secrets in a secret manager and rotated
+- [ ] Resource requests/limits set; runtime tuned to them
+- [ ] Health probes (startup, liveness, readiness) configured
 
 ### Monitoring
-
-- [ ] Structured logging enabled
-- [ ] Metrics exposed (/metrics endpoint)
-- [ ] Distributed tracing configured
-- [ ] Alerting rules defined
-- [ ] Dashboards created
+- [ ] Structured JSON logs with trace IDs
+- [ ] RED metrics + business metrics exported
+- [ ] Distributed tracing with context propagation (including through queues)
+- [ ] SLOs, burn-rate alerts, runbooks
+- [ ] Dashboards with deploy markers
 
 ### Performance
-
-- [ ] Connection pooling configured (DB, Redis)
-- [ ] Caching strategy implemented
-- [ ] Query optimization verified (no N+1)
-- [ ] Rate limiting enabled
-- [ ] Compression enabled (gzip)
+- [ ] Connection pools sized (DB, cache, HTTP clients)
+- [ ] Caching where measured to help
+- [ ] No N+1 queries on hot paths; slow-query logging on
+- [ ] Rate limiting and request size limits
+- [ ] Response compression; static assets on a CDN
 
 ### Security
-
-- [ ] HTTPS enforced
-- [ ] CORS configured correctly
-- [ ] Input validation on all endpoints
-- [ ] Authentication required where needed
-- [ ] Secrets not in code/logs
-- [ ] Security headers set (CSP, HSTS, etc.)
+- [ ] HTTPS/TLS everywhere; HSTS
+- [ ] CORS allow-list
+- [ ] Input validation on every endpoint; output encoding
+- [ ] Authentication and object-level authorization enforced
+- [ ] No secrets or PII in code, images, or logs
+- [ ] Security headers set (CSP, HSTS, nosniff, …)
 
 ### Reliability
-
-- [ ] Circuit breakers configured
-- [ ] Retry logic with backoff
-- [ ] Graceful shutdown handling
-- [ ] Database connection recovery
-- [ ] Queue consumer recovery
-
-### Observability
-
-```python
-# Graceful shutdown
-import signal
-
-@app.on_event("startup")
-async def startup():
-    # Initialize connections
-    await database.connect()
-    await redis.connect()
-    await rabbitmq.connect()
-
-    # Register signal handlers
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
-
-async def shutdown():
-    logger.info("Shutting down gracefully...")
-
-    # Stop accepting new requests
-    # Wait for in-flight requests (handled by uvicorn)
-
-    # Close connections
-    await rabbitmq.close()
-    await redis.close()
-    await database.disconnect()
-
-    logger.info("Shutdown complete")
-```
+- [ ] Timeouts on every outbound call; retries with backoff + jitter (one layer only)
+- [ ] Circuit breakers / bulkheads for critical dependencies
+- [ ] Graceful shutdown within the grace period
+- [ ] Idempotent message consumers; DLQ with replay tooling
+- [ ] Backups automated **and restore-tested**; disaster recovery plan documented

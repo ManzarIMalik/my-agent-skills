@@ -1,244 +1,205 @@
 # Microservices Patterns
 
+Pseudocode conventions are in [SKILL.md](../SKILL.md#pseudocode-conventions). Resilience libraries per language: [language-adaptation.md](language-adaptation.md#ecosystem-toolbox).
+
 ## Table of Contents
 
-1. [Service-to-Service Communication](#service-to-service-communication)
-2. [Circuit Breaker Pattern](#circuit-breaker-pattern)
-3. [Retry with Exponential Backoff](#retry-with-exponential-backoff)
-4. [Service Discovery](#service-discovery)
+1. [Service Boundaries](#service-boundaries)
+2. [Service-to-Service Communication](#service-to-service-communication)
+3. [Timeouts and Deadlines](#timeouts-and-deadlines)
+4. [Retry with Exponential Backoff](#retry-with-exponential-backoff)
+5. [Circuit Breaker Pattern](#circuit-breaker-pattern)
+6. [Bulkheads, Fallbacks, Load Shedding](#bulkheads-fallbacks-load-shedding)
+7. [Service Discovery and Load Balancing](#service-discovery-and-load-balancing)
+8. [API Gateway and BFF](#api-gateway-and-bff)
+9. [Data Ownership](#data-ownership)
+
+---
+
+## Service Boundaries
+
+- **One service per bounded context**, owned by one team, with its own data store. If two services must always deploy together or share tables, they're one service.
+- **Prefer coarse-grained services**. Chains of synchronous calls (A → B → C → D) multiply latency and failure probability.
+- **Design for failure**: every remote call can be slow, fail, or succeed without you knowing (timeout after the server committed).
 
 ---
 
 ## Service-to-Service Communication
 
-### REST API Calls
+| Style | Use for | Notes |
+|---|---|---|
+| **Synchronous HTTP/REST** | Queries needing an immediate answer, public-ish internal APIs | Simple, debuggable; couples availability |
+| **gRPC** | High-volume internal calls, streaming, strict typed contracts across languages | Codegen in every major language from one `.proto` |
+| **Asynchronous events/commands** | State changes others react to, long-running work | Decouples availability; eventual consistency — see [event-driven.md](event-driven.md) |
 
-```python
-import httpx
+### Client adapter (HTTP)
 
-class UserServiceClient:
-    def __init__(self, base_url: str, timeout: int = 30):
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=timeout,
-            headers={"User-Agent": "order-service/1.0"}
-        )
+Wrap each remote service in a client adapter that implements a port, so use cases don't know about HTTP:
 
-    async def get_user(self, user_id: UUID) -> User:
-        response = await self._client.get(f"/api/v1/users/{user_id}")
-        response.raise_for_status()
-        return User(**response.json())
-
-    async def check_user_tier(self, user_id: UUID) -> str:
-        response = await self._client.get(f"/api/v1/users/{user_id}/tier")
-        response.raise_for_status()
-        return response.json()["tier"]
-
-    async def close(self) -> None:
-        await self._client.aclose()
 ```
-
-### gRPC Calls
-
-```protobuf
-// proto/user_service.proto
-syntax = "proto3";
-package user;
-
-service UserService {
-  rpc GetUser(GetUserRequest) returns (UserResponse);
-  rpc CheckUserTier(CheckUserTierRequest) returns (CheckUserTierResponse);
+interface UserDirectory {                       // port, defined by the consuming service
+  getUser(id: UserId) -> UserSummary?
 }
 
-message GetUserRequest { string user_id = 1; }
-message UserResponse { string id = 1; string email = 2; string name = 3; string tier = 4; }
+class HttpUserDirectory(http: HttpClient, baseUrl: string) implements UserDirectory {
+  // http client created once and reused (connection pooling), with default timeouts
+  getUser(id) -> UserSummary? {
+    response = http.get(baseUrl + "/v1/users/" + id,
+                        headers = { "User-Agent": "order-service/1.4.2", traceparent: currentTrace() },
+                        timeout = 2 seconds)
+    match response.status {
+      200 -> return UserSummary.fromJson(response.body)       // map to *this* service's model
+      404 -> return none
+      else -> fail ExternalServiceError("user-service", response.status, response.bodySnippet)
+    }
+  }
+}
 ```
 
-```python
-import grpc
-from proto import user_service_pb2, user_service_pb2_grpc
+### gRPC contract
 
-class GrpcUserServiceClient:
-    def __init__(self, host: str, port: int):
-        self._channel = grpc.aio.insecure_channel(f"{host}:{port}")
-        self._stub = user_service_pb2_grpc.UserServiceStub(self._channel)
+```protobuf
+// contracts/proto/user/v1/user_service.proto
+syntax = "proto3";
+package user.v1;
 
-    async def get_user(self, user_id: str) -> User:
-        request = user_service_pb2.GetUserRequest(user_id=user_id)
-        response = await self._stub.GetUser(request)
-        return User(id=UUID(response.id), email=response.email, name=response.name, tier=response.tier)
+service UserService {
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+}
 
-    async def close(self) -> None:
-        await self._channel.close()
+message GetUserRequest  { string user_id = 1; }
+message GetUserResponse { string id = 1; string email = 2; string name = 3; string tier = 4; }
 ```
 
-### Message-Based Communication
-
-```python
-class OrderServiceMessaging:
-    def __init__(self, event_bus: EventBus):
-        self._event_bus = event_bus
-
-    async def publish_order_created(self, order: Order) -> None:
-        event = OrderCreatedEvent.from_entity(order)
-        await self._event_bus.publish(event)
-```
+Generate the client in the consuming service's language (`protoc`/`buf` plugins exist for Go, Java/Kotlin, C#, TS, Python, Rust, PHP, Ruby, Swift, Dart, Elixir) and wrap it in an adapter exactly like the HTTP one. Use TLS (mTLS inside a mesh) — never plaintext channels in production.
 
 ---
 
-## Circuit Breaker Pattern
+## Timeouts and Deadlines
 
-```python
-from enum import Enum
-from datetime import datetime, timedelta
+The single most important resilience setting. **Every** network call (HTTP, gRPC, DB, cache, broker) needs a timeout.
 
-class CircuitState(Enum):
-    CLOSED = "closed"      # Normal operation
-    OPEN = "open"          # Failing, reject requests
-    HALF_OPEN = "half_open"  # Testing recovery
-
-class CircuitBreaker:
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        timeout_duration: int = 60,
-        expected_exception: type[Exception] = Exception
-    ):
-        self.failure_threshold = failure_threshold
-        self.timeout_duration = timeout_duration
-        self.expected_exception = expected_exception
-
-        self.failure_count = 0
-        self.last_failure_time: Optional[datetime] = None
-        self.state = CircuitState.CLOSED
-
-    async def call(self, func: Callable[[], Awaitable[T]]) -> T:
-        if self.state == CircuitState.OPEN:
-            if self._should_attempt_reset():
-                self.state = CircuitState.HALF_OPEN
-            else:
-                raise CircuitBreakerOpenError("Circuit breaker is OPEN")
-
-        try:
-            result = await func()
-            self._on_success()
-            return result
-        except self.expected_exception:
-            self._on_failure()
-            raise
-
-    def _on_success(self) -> None:
-        self.failure_count = 0
-        self.state = CircuitState.CLOSED
-
-    def _on_failure(self) -> None:
-        self.failure_count += 1
-        self.last_failure_time = datetime.utcnow()
-
-        if self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
-
-    def _should_attempt_reset(self) -> bool:
-        if not self.last_failure_time:
-            return True
-        return datetime.utcnow() - self.last_failure_time > timedelta(seconds=self.timeout_duration)
-
-# Usage
-class ResilientUserServiceClient:
-    def __init__(self, client: UserServiceClient):
-        self._client = client
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=5, timeout_duration=60, expected_exception=httpx.HTTPError
-        )
-
-    async def get_user(self, user_id: UUID) -> User:
-        try:
-            return await self._circuit_breaker.call(lambda: self._client.get_user(user_id))
-        except CircuitBreakerOpenError:
-            logger.warning(f"Circuit breaker open, using fallback for user {user_id}")
-            return await self._get_user_from_cache(user_id)
-```
+- Set **connect** and **overall request** timeouts explicitly; library defaults are often infinite or very long.
+- **Propagate deadlines**: if the incoming request has 800 ms left, downstream calls get less than that, not a fresh 30 s. (gRPC deadlines, Go `context.WithTimeout`, .NET `CancellationToken`, `AbortSignal`, Kotlin `withTimeout`.)
+- Timeouts should be shorter the deeper the call is in the chain.
 
 ---
 
 ## Retry with Exponential Backoff
 
-```python
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+Retry only **transient** failures (timeouts, connection resets, 502/503/504, 429 with `Retry-After`) and only **idempotent** operations (or ones made idempotent with keys).
 
-class ExternalAPIClient:
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError)),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
-    async def fetch_data(self, url: str) -> dict:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=5.0)
-            response.raise_for_status()
-            return response.json()
-
-    # Custom retry logic
-    async def fetch_with_custom_retry(self, url: str, max_retries: int = 3) -> dict:
-        for attempt in range(max_retries):
-            try:
-                return await self._do_fetch(url)
-            except httpx.HTTPError as e:
-                if attempt == max_retries - 1:
-                    raise
-
-                wait_time = 2 ** attempt  # Exponential backoff
-                logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-                await asyncio.sleep(wait_time)
 ```
+retry(operation, maxAttempts = 3, baseDelay = 200ms, maxDelay = 5s) {
+  for attempt in 1..maxAttempts {
+    try {
+      return operation()
+    } catch error {
+      if not isTransient(error) or attempt == maxAttempts: rethrow error
+      delay = random(0, min(maxDelay, baseDelay × 2^(attempt-1)))      // "full jitter"
+      if error.retryAfter is present: delay = max(delay, error.retryAfter)
+      log.warn("retrying", attempt, delay, error)
+      sleep(delay)                                                   // non-blocking sleep in async runtimes
+    }
+  }
+}
+```
+
+- **Jitter** prevents synchronised retry storms.
+- **Retry at one layer only** — retries at every hop multiply (3 × 3 × 3 = 27 attempts).
+- Use a **retry budget** (e.g. retries ≤ 10% of requests) to avoid amplifying an outage.
+- Prefer the ecosystem's library (Resilience4j, Polly, cockatiel, tenacity, `backoff`, …) over hand-rolled loops.
 
 ---
 
-## Service Discovery
+## Circuit Breaker Pattern
 
-```python
-import random
+Stops calling a dependency that's clearly failing, giving it room to recover and failing fast for callers.
 
-class ServiceRegistry:
-    def __init__(self):
-        self._services: dict[str, list[str]] = {}
-
-    def register(self, service_name: str, instance_url: str) -> None:
-        if service_name not in self._services:
-            self._services[service_name] = []
-
-        if instance_url not in self._services[service_name]:
-            self._services[service_name].append(instance_url)
-            logger.info(f"Registered {service_name} at {instance_url}")
-
-    def deregister(self, service_name: str, instance_url: str) -> None:
-        if service_name in self._services:
-            self._services[service_name].remove(instance_url)
-
-    def discover(self, service_name: str) -> Optional[str]:
-        instances = self._services.get(service_name, [])
-        if not instances:
-            return None
-        return random.choice(instances)  # Simple load balancing
-
-    def get_all_instances(self, service_name: str) -> list[str]:
-        return self._services.get(service_name, []).copy()
-
-class ServiceAwareClient:
-    def __init__(self, registry: ServiceRegistry, service_name: str):
-        self._registry = registry
-        self._service_name = service_name
-
-    async def make_request(self, path: str) -> dict:
-        instance_url = self._registry.discover(self._service_name)
-
-        if not instance_url:
-            raise ServiceUnavailableError(f"{self._service_name} not available")
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{instance_url}{path}")
-            response.raise_for_status()
-            return response.json()
 ```
+CLOSED ──(failure rate ≥ threshold over window)──► OPEN ──(cool-down elapsed)──► HALF_OPEN
+   ▲                                                                                │
+   └────────────(trial calls succeed)──────────────────────────────(trial fails)───┘──► OPEN
+```
+
+```
+class CircuitBreaker(failureThreshold = 5, coolDown = 30 seconds, halfOpenMaxCalls = 1, clock) {
+  state = CLOSED; failures = 0; openedAt = none; halfOpenInFlight = 0     // guard with a lock/atomics if shared
+
+  call(operation) {
+    if state == OPEN:
+      if clock.now() - openedAt < coolDown: fail CircuitOpen()
+      state = HALF_OPEN
+    if state == HALF_OPEN and halfOpenInFlight >= halfOpenMaxCalls: fail CircuitOpen()
+
+    if state == HALF_OPEN: halfOpenInFlight += 1
+    try {
+      result = operation()
+      onSuccess(); return result
+    } catch error {
+      if countsAsFailure(error): onFailure()        // don't count 4xx client errors
+      rethrow error
+    } finally {
+      if state == HALF_OPEN: halfOpenInFlight -= 1
+    }
+  }
+
+  onSuccess() { failures = 0; state = CLOSED }
+  onFailure() {
+    failures += 1
+    if state == HALF_OPEN or failures >= failureThreshold:
+      state = OPEN; openedAt = clock.now()
+      log.warn("circuit opened"); metrics.gauge("circuit_state", OPEN)
+  }
+}
+
+// Usage: decorate the client adapter
+class ResilientUserDirectory(inner: UserDirectory, breaker: CircuitBreaker, cache: Cache) implements UserDirectory {
+  getUser(id) {
+    try { return breaker.call(() -> retry(() -> inner.getUser(id))) }
+    catch CircuitOpen { return cachedOrDegraded(id) }            // explicit fallback
+  }
+}
+```
+
+Production breakers usually use a **sliding window failure rate** (e.g. ≥ 50% of the last 20 calls) rather than a raw count, and expose state as a metric.
+
+---
+
+## Bulkheads, Fallbacks, Load Shedding
+
+- **Bulkhead**: separate connection pools / concurrency limits per dependency, so a slow dependency can't exhaust all threads/connections.
+- **Fallback**: a deliberate degraded response — cached value, default, partial result, "try again later". Make fallbacks visible in metrics.
+- **Load shedding**: reject early (429/503) when queues or concurrency exceed limits, rather than accepting work you'll time out on.
+- **Rate limiting** outbound calls to respect partners' quotas.
+
+---
+
+## Service Discovery and Load Balancing
+
+Usually provided by the platform — don't hand-roll a registry:
+
+| Platform | Mechanism |
+|---|---|
+| Kubernetes | `Service` DNS names (`http://user-service.default.svc`) + kube-proxy or a service mesh |
+| Service mesh (Istio, Linkerd, Consul Connect) | Sidecar/ambient proxies: discovery, mTLS, retries, timeouts, circuit breaking, traffic shifting |
+| Cloud | Load balancers, Cloud Map / Service Connect, internal DNS |
+| VMs / bare metal | Consul, etcd, or DNS SRV with health checks |
+
+If retries/timeouts/breakers are configured in a mesh, don't also configure aggressive ones in code — pick one layer and document it.
+
+---
+
+## API Gateway and BFF
+
+- **API gateway**: single entry point for external clients — TLS termination, authentication, rate limiting, routing, request/response transformation (Kong, Envoy, NGINX, Traefik, cloud gateways).
+- **Backend for Frontend (BFF)**: a thin service per client type (web, mobile) that aggregates and shapes backend data for that client. Keeps chatty composition off the device and lets each client evolve independently. Keep business logic out of it.
+
+---
+
+## Data Ownership
+
+- **Each service owns its data; no other service reads its tables.** Sharing a database couples deploys and schemas.
+- To use another service's data: **call its API**, or **subscribe to its events** and keep a local read-only projection of the fields you need.
+- Cross-service consistency is **eventual** — design UX and business processes for it (pending states, sagas — see [event-driven.md](event-driven.md#saga-pattern)).
+- Reporting across services goes through a data pipeline / warehouse, not cross-service joins.

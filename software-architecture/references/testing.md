@@ -1,342 +1,247 @@
 # Testing Strategy
 
+Pseudocode conventions are in [SKILL.md](../SKILL.md#pseudocode-conventions). Test frameworks per language are in [language-adaptation.md](language-adaptation.md#ecosystem-toolbox). The layered architecture exists largely to make this strategy cheap: the domain and use cases are testable without any infrastructure.
+
 ## Table of Contents
 
-1. [Unit Testing](#unit-testing)
-2. [Integration Testing](#integration-testing)
-3. [End-to-End Testing](#end-to-end-testing)
-4. [Test Fixtures & Factories](#test-fixtures--factories)
+1. [Test Portfolio](#test-portfolio)
+2. [Unit Testing](#unit-testing)
+3. [Test Doubles: Fakes over Mocks](#test-doubles-fakes-over-mocks)
+4. [Integration Testing](#integration-testing)
+5. [Contract Testing](#contract-testing)
+6. [End-to-End Testing](#end-to-end-testing)
+7. [Test Data Builders and Fixtures](#test-data-builders-and-fixtures)
+8. [Other Test Types](#other-test-types)
+9. [Testing Practices](#testing-practices)
+
+---
+
+## Test Portfolio
+
+| Layer | What | Dependencies | Speed | Share |
+|---|---|---|---|---|
+| **Unit** | Domain entities, value objects, domain services, use cases | None (fakes for ports) | ms | Most tests |
+| **Integration** | Repository adapters, cache/broker adapters, HTTP handlers with real framework | Real DB/cache/broker in containers | 100s of ms | Every adapter |
+| **Contract** | API/event compatibility between services | Contract files / broker | fast | Every service boundary |
+| **End-to-end** | Critical user journeys through the deployed system | Everything | seconds | A handful |
+
+Test **behaviour through public interfaces**, not implementation details — tests should survive refactoring.
 
 ---
 
 ## Unit Testing
 
-```python
-import pytest
-from unittest.mock import AsyncMock, MagicMock
-from decimal import Decimal
+### Domain logic — no doubles needed
 
-# Test domain logic
-class TestOrder:
-    def test_create_order_success(self):
-        items = [OrderItem.create(product_id=uuid4(), quantity=2, price=Decimal("10.00"))]
-        order = Order.create(user_id=uuid4(), items=items)
-
-        assert order.status == OrderStatus.PENDING
-        assert order.subtotal == Decimal("20.00")
-
-    def test_create_order_without_items_fails(self):
-        with pytest.raises(BusinessRuleViolationError) as exc_info:
-            Order.create(user_id=uuid4(), items=[])
-
-        assert exc_info.value.rule == "order_must_have_items"
-
-    def test_confirm_order_success(self):
-        order = create_order_fixture()
-        order.confirm()
-
-        assert order.status == OrderStatus.CONFIRMED
-
-    def test_confirm_non_pending_order_fails(self):
-        order = create_order_fixture()
-        order.confirm()
-
-        with pytest.raises(BusinessRuleViolationError):
-            order.confirm()
-
-# Test use cases with mocks
-class TestGetUserUseCase:
-    @pytest.fixture
-    def use_case(self):
-        return GetUserUseCase(
-            user_repo=AsyncMock(spec=UserRepository),
-            cache=AsyncMock(spec=CacheService)
-        )
-
-    @pytest.mark.asyncio
-    async def test_returns_cached_user(self, use_case):
-        user_data = '{"id": "123", "email": "test@example.com", "name": "Test"}'
-        use_case.cache.get.return_value = user_data
-
-        result = await use_case.execute("123")
-
-        assert result.email == "test@example.com"
-        use_case.user_repo.get_by_id.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_fetches_from_db_on_cache_miss(self, use_case):
-        use_case.cache.get.return_value = None
-        use_case.user_repo.get_by_id.return_value = User(
-            id="123", email=Email("test@example.com"), name="Test"
-        )
-
-        result = await use_case.execute("123")
-
-        assert result.email == "test@example.com"
-        use_case.cache.set.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_raises_not_found_error(self, use_case):
-        use_case.cache.get.return_value = None
-        use_case.user_repo.get_by_id.return_value = None
-
-        with pytest.raises(EntityNotFoundError):
-            await use_case.execute("123")
-
-# Test value objects
-class TestEmail:
-    def test_valid_email(self):
-        email = Email("test@example.com")
-        assert str(email) == "test@example.com"
-
-    def test_invalid_email_raises_error(self):
-        with pytest.raises(ValueError):
-            Email("invalid-email")
 ```
+describe "Order" {
+  test "create computes subtotal" {
+    order = Order.create(customerId = aCustomerId(), items = [anItem(quantity = 2, unitPrice = eur("10.00"))], clock = fixedClock)
+    expect(order.status).toEqual(PENDING)
+    expect(order.subtotal()).toEqual(eur("20.00"))
+  }
+
+  test "create without items is rejected" {
+    error = expectFailure(() -> Order.create(aCustomerId(), items = [], clock = fixedClock))
+    expect(error).toBe(RuleViolated)
+    expect(error.rule).toEqual("order_must_have_items")
+  }
+
+  test "confirm emits OrderConfirmed" {
+    order = anOrder().build()
+    order.confirm(fixedClock)
+    expect(order.status).toEqual(CONFIRMED)
+    expect(order.pullEvents()).toContainOnly(OrderConfirmed(orderId = order.id, ...))
+  }
+
+  test "confirming twice is rejected" {
+    order = anOrder().confirmed().build()
+    expect(() -> order.confirm(fixedClock)).toFailWith(RuleViolated)
+  }
+}
+
+describe "Email" {
+  test "accepts and normalises a valid address" { expect(Email(" Ada@Example.com ").value).toEqual("ada@example.com") }
+  test "rejects an invalid address"            { expect(() -> Email("not-an-email")).toFailWith(InvalidInput) }
+}
+```
+
+### Use cases — with fakes for ports
+
+```
+describe "GetUserUseCase" {
+  setup {
+    users = InMemoryUserRepository()
+    useCase = GetUserUseCase(users)
+  }
+
+  test "returns the user" {
+    users.save(aUser(id = "u1", email = "ada@example.com"))
+    expect(useCase.execute("u1").email).toEqual("ada@example.com")
+  }
+
+  test "fails with NotFound for unknown id" {
+    expect(() -> useCase.execute("missing")).toFailWith(NotFound)
+  }
+}
+
+describe "CachedUserRepository" {
+  test "serves from cache without hitting the inner repository" {
+    inner = CountingUserRepository(InMemoryUserRepository(with = [aUser(id = "u1")]))
+    repo = CachedUserRepository(inner, InMemoryCache(), ttl = 5 minutes)
+    repo.getById("u1"); repo.getById("u1")
+    expect(inner.getByIdCalls).toEqual(1)
+  }
+}
+```
+
+Use parameterised/table-driven tests for many input variations (JUnit `@ParameterizedTest`, xUnit `[Theory]`, `test.each`, `pytest.mark.parametrize`, Go table-driven tests with `t.Run`, `rstest`, Pest datasets, RSpec shared examples, ExUnit `for` comprehensions).
+
+---
+
+## Test Doubles: Fakes over Mocks
+
+| Double | What | Use when |
+|---|---|---|
+| **Fake** | A working lightweight implementation (in-memory repository, in-memory event bus, fixed clock) | Default for ports you own — tests read naturally and don't break on refactors |
+| **Stub** | Returns canned answers | Simulating a specific response/failure from a dependency |
+| **Mock / spy** | Records calls for verification | The interaction itself *is* the behaviour (an email was sent, an event was published) |
+
+```
+class InMemoryUserRepository implements UserRepository {
+  private data: Map<UserId, User>
+  getById(id) { return data.get(id) }
+  save(user)  { data.put(user.id, user) }
+}
+
+class FixedClock(instant) implements Clock { now() { return instant } }
+```
+
+Over-mocking (asserting every call, mocking types you don't own) produces brittle tests that verify the implementation rather than the behaviour. Don't mock the database driver — use an integration test instead. **Run the same contract test suite against the fake and the real adapter** to keep them honest.
 
 ---
 
 ## Integration Testing
 
-```python
-import pytest
-from testcontainers.postgres import PostgresContainer
-from testcontainers.redis import RedisContainer
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+Test adapters against **real** infrastructure, started in containers. Testcontainers has libraries for Java, .NET, Node, Python, Go, Rust, PHP, Ruby, Elixir (or use `docker compose` in CI).
 
-@pytest.fixture(scope="session")
-def postgres_container():
-    with PostgresContainer("postgres:15") as postgres:
-        yield postgres
-
-@pytest.fixture(scope="session")
-def redis_container():
-    with RedisContainer("redis:7") as redis:
-        yield redis
-
-@pytest.fixture
-async def db_session(postgres_container):
-    url = postgres_container.get_connection_url().replace("postgresql://", "postgresql+asyncpg://")
-    engine = create_async_engine(url)
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async_session = async_sessionmaker(engine, expire_on_commit=False)
-
-    async with async_session() as session:
-        yield session
-        await session.rollback()
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-@pytest.fixture
-async def redis_client(redis_container):
-    from redis.asyncio import Redis
-    client = Redis.from_url(redis_container.get_connection_url())
-    yield client
-    await client.flushall()
-    await client.close()
-
-# Repository tests
-class TestPostgresUserRepository:
-    @pytest.mark.asyncio
-    async def test_save_and_get_user(self, db_session):
-        repo = PostgresUserRepository(db_session)
-
-        user = User(email=Email("test@example.com"), name="Test User")
-        saved = await repo.save(user)
-
-        fetched = await repo.get_by_id(str(saved.id))
-
-        assert fetched is not None
-        assert fetched.email.value == "test@example.com"
-
-    @pytest.mark.asyncio
-    async def test_get_by_email(self, db_session):
-        repo = PostgresUserRepository(db_session)
-
-        user = User(email=Email("unique@example.com"), name="Test")
-        await repo.save(user)
-
-        fetched = await repo.get_by_email("unique@example.com")
-
-        assert fetched is not None
-        assert str(fetched.id) == str(user.id)
-
-# Cache tests
-class TestRedisCacheService:
-    @pytest.mark.asyncio
-    async def test_set_and_get(self, redis_client):
-        cache = RedisCacheService(redis_client)
-
-        await cache.set("key", "value", ttl=60)
-        result = await cache.get("key")
-
-        assert result == "value"
-
-    @pytest.mark.asyncio
-    async def test_expired_key_returns_none(self, redis_client):
-        cache = RedisCacheService(redis_client)
-
-        await cache.set("key", "value", ttl=1)
-        await asyncio.sleep(1.1)
-
-        result = await cache.get("key")
-        assert result is None
 ```
+suite "SqlUserRepository" {
+  beforeAll {
+    postgres = Container("postgres:16").start()
+    pool = Database.connect(postgres.connectionUrl)
+    runMigrations(pool)                                  // the real migrations, not a hand-written schema
+  }
+  afterAll { pool.close(); postgres.stop() }
+
+  beforeEach { conn = pool.acquire(); conn.begin(); repo = SqlUserRepository(conn) }
+  afterEach  { conn.rollback(); pool.release(conn) }     // isolation: every test rolls back
+
+  test "save then get round-trips" {
+    user = aUser(email = "ada@example.com")
+    repo.save(user)
+    expect(repo.getById(user.id)).toEqual(user)
+  }
+
+  test "get by email is case-insensitive" {
+    repo.save(aUser(email = "Ada@Example.com"))
+    expect(repo.getByEmail(Email("ada@example.com"))).toBePresent()
+  }
+
+  test "loading orders with items uses bounded queries" {
+    seedOrdersWithItems(count = 20)
+    queries = countQueries { orderRepo.findByCustomer(customerId, page(20)) }
+    expect(queries).toBeLessThanOrEqual(2)               // guards against N+1 regressions
+  }
+}
+```
+
+**HTTP layer**: start the app in-process with its real router, middleware, and serialisation, but with fakes or containers behind it (Spring `MockMvc`/`WebTestClient`, ASP.NET `WebApplicationFactory`, `supertest`/`fastify.inject`, FastAPI/Starlette `TestClient`, Go `httptest`, Axum `oneshot`, Laravel HTTP tests, Rails request specs, Phoenix `ConnTest`).
+
+```
+suite "Users API" {
+  test "POST /v1/users creates a user" {
+    response = client.post("/v1/users", json = { email: "new@example.com", name: "New User", password: "correct-horse-battery" })
+    expect(response.status).toEqual(201)
+    expect(response.json.email).toEqual("new@example.com")
+    expect(response.headers.Location).toMatch("/v1/users/")
+  }
+  test "GET /v1/users/{id} requires authentication" {
+    expect(client.get("/v1/users/123").status).toEqual(401)
+  }
+  test "validation errors use problem+json" {
+    response = client.post("/v1/users", json = { email: "nope" })
+    expect(response.status).toEqual(422)
+    expect(response.headers["Content-Type"]).toContain("application/problem+json")
+  }
+}
+```
+
+For **third-party HTTP APIs**, use a local HTTP stub server (WireMock, MockServer, `nock`/`msw`, `respx`, `httptest.Server`, `wiremock-rs`) to simulate success, errors, slowness, and timeouts.
+
+---
+
+## Contract Testing
+
+Between services, end-to-end tests are slow and flaky. Instead:
+
+- **Consumer-driven contracts** (Pact, Spring Cloud Contract): each consumer publishes the requests/responses it relies on; the provider verifies them in its CI.
+- **Schema checks**: lint OpenAPI/Protobuf/AsyncAPI and fail CI on breaking changes (`buf breaking`, `oasdiff`, schema registry compatibility rules).
+- **Event contracts**: producers test that emitted events validate against the published schema; consumers test they can parse fixtures of every supported version.
 
 ---
 
 ## End-to-End Testing
 
-```python
-import pytest
-from httpx import AsyncClient
-from asgi_lifespan import LifespanManager
-
-@pytest.fixture
-async def app():
-    from main import app
-    async with LifespanManager(app):
-        yield app
-
-@pytest.fixture
-async def client(app):
-    async with AsyncClient(app=app, base_url="http://test") as client:
-        yield client
-
-@pytest.fixture
-async def auth_headers(client):
-    # Create test user and get token
-    response = await client.post("/api/v1/auth/register", json={
-        "email": "test@example.com",
-        "name": "Test User",
-        "password": "SecurePass123"
-    })
-    token = response.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
-
-class TestUserAPI:
-    @pytest.mark.asyncio
-    async def test_create_user(self, client):
-        response = await client.post("/api/v1/users", json={
-            "email": "new@example.com",
-            "name": "New User",
-            "password": "SecurePass123"
-        })
-
-        assert response.status_code == 201
-        assert response.json()["email"] == "new@example.com"
-
-    @pytest.mark.asyncio
-    async def test_get_user_unauthorized(self, client):
-        response = await client.get("/api/v1/users/123")
-        assert response.status_code == 401
-
-    @pytest.mark.asyncio
-    async def test_get_user_success(self, client, auth_headers):
-        # First create
-        create_response = await client.post("/api/v1/users", json={
-            "email": "fetch@example.com", "name": "Fetch User", "password": "SecurePass123"
-        })
-        user_id = create_response.json()["id"]
-
-        # Then fetch
-        response = await client.get(f"/api/v1/users/{user_id}", headers=auth_headers)
-
-        assert response.status_code == 200
-        assert response.json()["email"] == "fetch@example.com"
-
-class TestOrderAPI:
-    @pytest.mark.asyncio
-    async def test_create_order_flow(self, client, auth_headers):
-        # Create order
-        response = await client.post("/api/v1/orders", headers=auth_headers, json={
-            "items": [{"product_id": str(uuid4()), "quantity": 2, "price": "25.00"}]
-        })
-
-        assert response.status_code == 201
-        order_id = response.json()["id"]
-
-        # Confirm order
-        response = await client.post(f"/api/v1/orders/{order_id}/confirm", headers=auth_headers)
-        assert response.status_code == 200
-        assert response.json()["status"] == "confirmed"
-```
+- Cover only **critical journeys** (sign up → place order → pay → receive confirmation).
+- Run against a production-like environment with seeded data; make tests independent and idempotent.
+- Browser/app UIs: Playwright, Cypress, Selenium; mobile: XCUITest, Espresso, Maestro, Detox, Flutter integration tests.
+- Track flakiness; quarantine and fix flaky tests rather than retrying them forever.
 
 ---
 
-## Test Fixtures & Factories
+## Test Data Builders and Fixtures
 
-```python
-import factory
-from factory.alchemy import SQLAlchemyModelFactory
+Builders give each test valid defaults and let it state only what matters:
 
-# Factories
-class UserFactory(SQLAlchemyModelFactory):
-    class Meta:
-        model = UserModel
-        sqlalchemy_session_persistence = "commit"
-
-    id = factory.LazyFunction(uuid4)
-    email = factory.Sequence(lambda n: f"user{n}@example.com")
-    name = factory.Faker("name")
-    password_hash = factory.LazyFunction(lambda: hash_password("password123"))
-    tier = UserTierEnum.BRONZE
-    is_active = True
-
-class OrderFactory(SQLAlchemyModelFactory):
-    class Meta:
-        model = OrderModel
-        sqlalchemy_session_persistence = "commit"
-
-    id = factory.LazyFunction(uuid4)
-    user = factory.SubFactory(UserFactory)
-    status = OrderStatusEnum.PENDING
-    total = factory.LazyFunction(lambda: Decimal("100.00"))
-
-# Fixtures
-@pytest.fixture
-def user_factory(db_session):
-    UserFactory._meta.sqlalchemy_session = db_session
-    return UserFactory
-
-@pytest.fixture
-def order_factory(db_session):
-    OrderFactory._meta.sqlalchemy_session = db_session
-    return OrderFactory
-
-# Usage
-class TestOrderRepository:
-    @pytest.mark.asyncio
-    async def test_find_by_user(self, db_session, user_factory, order_factory):
-        user = user_factory()
-        order_factory.create_batch(3, user=user)
-        order_factory.create_batch(2)  # Other user's orders
-
-        repo = PostgresOrderRepository(db_session)
-        orders = await repo.find_by_user(user.id)
-
-        assert len(orders) == 3
-
-# Domain fixtures
-def create_user_fixture(**kwargs) -> User:
-    defaults = {
-        "email": Email("test@example.com"),
-        "name": "Test User",
-        "tier": UserTier.BRONZE,
-        "is_active": True
-    }
-    defaults.update(kwargs)
-    return User(**defaults)
-
-def create_order_fixture(**kwargs) -> Order:
-    items = kwargs.pop("items", [
-        OrderItem.create(product_id=uuid4(), quantity=1, price=Decimal("50.00"))
-    ])
-    defaults = {"user_id": uuid4(), "items": items}
-    defaults.update(kwargs)
-    return Order.create(**defaults)
 ```
+anOrder() = OrderBuilder(
+  customerId = aCustomerId(),
+  items = [anItem()],
+  status = PENDING)
+
+class OrderBuilder {
+  withItems(items) -> OrderBuilder { ... }
+  confirmed() -> OrderBuilder { status = CONFIRMED; return this }
+  build() -> Order { ... uses domain factory so invariants hold ... }
+}
+
+// Persistence factories for integration tests (unique values per call)
+userFactory.create(email = sequence(n -> "user" + n + "@example.com"))
+orderFactory.createMany(3, customer = user)
+```
+
+Ecosystem tools: Instancio/EasyRandom (Java), AutoFixture/Bogus (.NET), `fishery`/`@faker-js/faker` (TS), `factory_boy`/`polyfactory` (Python), `gofakeit` (Go), `fake` (Rust), Laravel model factories, FactoryBot (Ruby), ExMachina (Elixir).
+
+- Prefer builders over large shared fixture files — shared fixtures couple unrelated tests.
+- Use **fixed clocks and seeded randomness** for determinism.
+
+---
+
+## Other Test Types
+
+- **Property-based tests** for invariants over many generated inputs (jqwik, FsCheck, fast-check, Hypothesis, `gopter`/`rapid`, `proptest`, StreamData): e.g. `Money.plus` is associative; serialising then deserialising returns the original.
+- **Performance/load tests** (k6, Gatling, Locust, JMeter, vegeta) for critical endpoints, run before major releases and against SLOs.
+- **Architecture tests** enforcing layer rules (ArchUnit, NetArchTest, dependency-cruiser, `import-linter`, Deptrac).
+- **Mutation testing** (PIT, Stryker, mutmut, cargo-mutants) to check the suite actually catches bugs in core logic.
+- **Security tests**: dependency scanning, SAST, DAST (OWASP ZAP) — see [security.md](security.md#supply-chain).
+
+---
+
+## Testing Practices
+
+- **Arrange–Act–Assert** structure; one behaviour per test; descriptive names (`confirming_twice_is_rejected`).
+- Tests run in **CI on every change**; the default branch is always green.
+- Measure coverage to find untested areas, but don't chase a number — 100% coverage of getters is worthless; untested pricing rules are dangerous.
+- Fast feedback: unit tests in seconds locally; integration in minutes in CI; parallelise where isolation allows.
+- Treat test code as production code: readable, refactored, reviewed.

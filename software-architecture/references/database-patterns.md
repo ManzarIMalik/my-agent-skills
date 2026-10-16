@@ -1,228 +1,214 @@
 # Database Patterns
 
+Data-layer guidance that holds across ORMs, query builders, and raw SQL. Examples use standard SQL (PostgreSQL dialect where it matters) because SQL is the common language across ecosystems. Library choices per language: [language-adaptation.md](language-adaptation.md#ecosystem-toolbox).
+
 ## Table of Contents
 
-1. [SQLAlchemy Models](#sqlalchemy-models)
-2. [Async Session Setup](#async-session-setup)
-3. [Query Optimization](#query-optimization)
-4. [Alembic Migrations](#alembic-migrations)
+1. [Choosing a Store](#choosing-a-store)
+2. [Schema Design](#schema-design)
+3. [Mapping Between Domain and Storage](#mapping-between-domain-and-storage)
+4. [Connections and Transactions](#connections-and-transactions)
+5. [Query Optimization](#query-optimization)
+6. [Concurrency Control](#concurrency-control)
+7. [Migrations](#migrations)
 
 ---
 
-## SQLAlchemy Models
+## Choosing a Store
 
-```python
-from sqlalchemy import String, ForeignKey, Numeric, DateTime, Boolean, Enum as SQLEnum, Index
-from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
-from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
-import enum
+| Need | Default choice |
+|---|---|
+| Transactions, relationships, ad-hoc queries | **Relational** (PostgreSQL, MySQL/MariaDB, SQL Server, SQLite for embedded/edge) |
+| Flexible documents, per-document atomicity | Document (MongoDB, Couchbase, or JSON columns in Postgres) |
+| Very high write throughput, known access patterns | Wide-column / key-value (Cassandra, ScyllaDB, DynamoDB) |
+| Full-text and faceted search | Search engine (OpenSearch/Elasticsearch, Meilisearch, Typesense, Postgres FTS for modest needs) |
+| Caching, ephemeral data, rate limits | In-memory store (Redis, Valkey, Memcached) |
+| Time series / analytics | TimescaleDB, ClickHouse, a warehouse |
 
-class Base(DeclarativeBase):
-    pass
+Start with one relational database unless a requirement clearly rules it out. Each extra store adds consistency, backup, and operational burden.
 
-class UserTierEnum(str, enum.Enum):
-    BRONZE = "bronze"
-    SILVER = "silver"
-    GOLD = "gold"
+---
 
-class UserModel(Base):
-    __tablename__ = "users"
+## Schema Design
 
-    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    name: Mapped[str] = mapped_column(String(100))
-    password_hash: Mapped[str] = mapped_column(String(255))
-    tier: Mapped[UserTierEnum] = mapped_column(SQLEnum(UserTierEnum), default=UserTierEnum.BRONZE)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+```sql
+CREATE TABLE users (
+  id            UUID PRIMARY KEY,
+  email         VARCHAR(254) NOT NULL,
+  name          VARCHAR(100) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  tier          VARCHAR(16)  NOT NULL DEFAULT 'bronze' CHECK (tier IN ('bronze','silver','gold')),
+  is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_users_email ON users (lower(email));
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+CREATE TABLE orders (
+  id           UUID PRIMARY KEY,
+  customer_id  UUID NOT NULL REFERENCES users(id),
+  status       VARCHAR(16) NOT NULL CHECK (status IN ('pending','confirmed','shipped','delivered','cancelled')),
+  total_amount NUMERIC(12,2) NOT NULL,
+  currency     CHAR(3) NOT NULL,
+  metadata     JSONB NOT NULL DEFAULT '{}',
+  version      INTEGER NOT NULL DEFAULT 0,          -- optimistic locking
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_orders_customer_status ON orders (customer_id, status);
+CREATE INDEX ix_orders_created_at      ON orders (created_at);
 
-    orders: Mapped[list["OrderModel"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+CREATE TABLE order_items (
+  id          UUID PRIMARY KEY,
+  order_id    UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id  UUID NOT NULL,
+  quantity    INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price  NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0)
+);
+CREATE INDEX ix_order_items_order ON order_items (order_id);
+```
 
-    __table_args__ = (
-        Index("idx_users_email_active", "email", "is_active"),
-    )
+Guidelines:
+- **Let the database enforce what it can**: `NOT NULL`, `UNIQUE`, foreign keys, `CHECK`. Application validation is not a substitute — concurrent requests and other writers bypass it.
+- **IDs**: UUIDs (prefer time-ordered UUIDv7 or ULID for index locality) let the domain create IDs before persisting; sequential integers are smaller and fine for internal tables. Don't expose guessable sequential IDs publicly where enumeration matters.
+- **Money**: `NUMERIC`/`DECIMAL` or integer minor units, plus a currency column. Never `FLOAT`.
+- **Time**: timezone-aware timestamps stored in UTC.
+- **Enums**: `CHECK` constraints or lookup tables are easier to evolve than native enum types in some databases.
+- **Index for your actual queries**: composite indexes in the order of equality filters then range/sort columns; index every foreign key you join or delete on. Too many indexes slow writes — measure.
+- **Soft delete** (`deleted_at`) only when there's a real need (audit, undo); it complicates every query and unique constraint.
+- **Separate schemas or databases per module/service** — a module's tables are private to it.
 
-class OrderStatusEnum(str, enum.Enum):
-    PENDING = "pending"
-    CONFIRMED = "confirmed"
-    SHIPPED = "shipped"
-    DELIVERED = "delivered"
-    CANCELLED = "cancelled"
+---
 
-class OrderModel(Base):
-    __tablename__ = "orders"
+## Mapping Between Domain and Storage
 
-    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
-    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    status: Mapped[OrderStatusEnum] = mapped_column(SQLEnum(OrderStatusEnum), default=OrderStatusEnum.PENDING, index=True)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
-    total: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+Two legitimate approaches; pick per context:
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+| Approach | When | How |
+|---|---|---|
+| **Separate persistence models** (data mapper) | Rich domain, need persistence ignorance | Repository maps rows/ORM models ↔ domain entities (`toEntity`, `toRow`). Domain types have no ORM annotations. |
+| **ORM entities are the domain model** (active record / annotated entities) | CRUD-heavy, simpler rules, framework-centric apps | Put behaviour on the ORM model; accept the coupling knowingly. |
 
-    user: Mapped["UserModel"] = relationship(back_populates="orders")
-    items: Mapped[list["OrderItemModel"]] = relationship(back_populates="order", cascade="all, delete-orphan", lazy="selectin")
-
-    __table_args__ = (
-        Index("idx_orders_user_status", "user_id", "status"),
-        Index("idx_orders_created_at", "created_at"),
-    )
-
-class OrderItemModel(Base):
-    __tablename__ = "order_items"
-
-    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
-    order_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"))
-    product_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), index=True)
-    quantity: Mapped[int] = mapped_column()
-    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-
-    order: Mapped["OrderModel"] = relationship(back_populates="items")
+```
+// Data-mapper style repository using a query builder / raw SQL
+class SqlOrderRepository(conn) implements OrderRepository {
+  get(id) -> Order? {
+    orderRow = conn.queryOne("SELECT * FROM orders WHERE id = $1", [id]) ?? return none
+    itemRows = conn.query("SELECT * FROM order_items WHERE order_id = $1", [id])
+    return OrderMapper.toEntity(orderRow, itemRows)
+  }
+}
 ```
 
 ---
 
-## Async Session Setup
+## Connections and Transactions
 
-```python
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+- **Use a connection pool** sized to the workload: roughly `(DB cores × 2) + effective spindle count` across *all* app instances is a common starting point — many small pools from many instances can exhaust the database. Use a proxy pooler (PgBouncer, RDS Proxy) when instance counts are high or serverless.
+- **Configure**: max size, acquire timeout, idle timeout, max lifetime (recycle), and a health/ping check.
+- **Scope transactions to a unit of work** — short, and never spanning network calls to other services. See [architecture-patterns.md](architecture-patterns.md#unit-of-work-pattern).
+- **Request-scoped session pattern**:
 
-engine = create_async_engine(
-    settings.database_url,
-    poolclass=QueuePool,
-    pool_size=20,
-    max_overflow=10,
-    pool_timeout=30,
-    pool_recycle=3600,
-    pool_pre_ping=True,
-    echo=settings.debug,
-    connect_args={"server_settings": {"jit": "off"}}
-)
-
-# For testing
-test_engine = create_async_engine(settings.test_database_url, poolclass=NullPool, echo=False)
-
-async_session_maker = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False,
-    autocommit=False,
-)
-
-async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_maker() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
 ```
+withTransaction(pool, work) {
+  conn = pool.acquire(timeout = 5 seconds)
+  try {
+    conn.begin()
+    result = work(conn)
+    conn.commit()
+    return result
+  } catch error {
+    conn.rollback()
+    rethrow error
+  } finally {
+    pool.release(conn)
+  }
+}
+```
+
+- **Tests** use a separate database (or containerised instance) and isolate tests via per-test transactions rolled back at the end, or truncation between tests.
 
 ---
 
 ## Query Optimization
 
-```python
-from sqlalchemy import select, func
-from sqlalchemy.orm import selectinload, joinedload
+### N+1 queries
 
-class PostgresOrderRepository(OrderRepository):
-    def __init__(self, session: AsyncSession):
-        self._session = session
+The most common ORM performance bug: loading a list, then lazily loading each child.
 
-    # Prevent N+1 with selectinload (2 queries: 1 for order, 1 for all items)
-    async def get_with_items(self, order_id: UUID) -> Optional[Order]:
-        result = await self._session.execute(
-            select(OrderModel)
-            .options(selectinload(OrderModel.items))
-            .where(OrderModel.id == order_id)
-        )
-        model = result.scalar_one_or_none()
-        return self._to_entity(model) if model else None
-
-    # Joined eager loading (single query)
-    async def get_with_user(self, order_id: UUID) -> Optional[Order]:
-        result = await self._session.execute(
-            select(OrderModel)
-            .options(joinedload(OrderModel.user))
-            .where(OrderModel.id == order_id)
-        )
-        model = result.scalar_one_or_none()
-        return self._to_entity(model) if model else None
-
-    # Efficient pagination
-    async def find_paginated(self, page: int, page_size: int, user_id: Optional[UUID] = None) -> tuple[list[Order], int]:
-        query = select(OrderModel).options(selectinload(OrderModel.items))
-        count_query = select(func.count()).select_from(OrderModel)
-
-        if user_id:
-            query = query.where(OrderModel.user_id == user_id)
-            count_query = count_query.where(OrderModel.user_id == user_id)
-
-        total = (await self._session.execute(count_query)).scalar()
-
-        query = query.offset((page - 1) * page_size).limit(page_size)
-        result = await self._session.execute(query)
-
-        return [self._to_entity(m) for m in result.scalars().all()], total
-
-    # Bulk insert
-    async def bulk_create(self, orders: list[Order]) -> list[Order]:
-        models = [self._to_model(order) for order in orders]
-        self._session.add_all(models)
-        await self._session.flush()
-
-        for model in models:
-            await self._session.refresh(model)
-
-        return [self._to_entity(m) for m in models]
 ```
+// ❌ N+1: 1 query for orders + N queries for items
+orders = query("SELECT * FROM orders WHERE customer_id = $1", [customerId])
+for o in orders: o.items = query("SELECT * FROM order_items WHERE order_id = $1", [o.id])
+
+// ✅ Batched: 2 queries total
+orders = query("SELECT * FROM orders WHERE customer_id = $1", [customerId])
+items  = query("SELECT * FROM order_items WHERE order_id = ANY($1)", [ids(orders)])
+attach(items, to = orders, by = order_id)
+
+// ✅ Or a join when the child set is small and you need one round trip
+query("SELECT o.*, i.* FROM orders o LEFT JOIN order_items i ON i.order_id = o.id WHERE o.id = $1", [id])
+```
+
+ORM equivalents: eager loading / `include` / `select_related`+`prefetch_related` / `selectinload` / `JOIN FETCH` / `Include()` / `preload` / `Repo.preload`. Turn on query logging in development and add tests that assert query counts for hot paths.
+
+### Pagination
+
+```sql
+-- Keyset (cursor) pagination — uses the index, stable under inserts
+SELECT * FROM orders
+WHERE customer_id = $1 AND (created_at, id) < ($2, $3)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- Offset pagination — simple, but cost grows with the offset
+SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20 OFFSET 40;
+```
+
+Avoid `COUNT(*)` on every page request for large tables; return `hasMore` or cache approximate counts.
+
+### Other habits
+
+- **Select only needed columns** for list views; build read-optimised queries for the query side (see CQRS in [architecture-patterns.md](architecture-patterns.md#cqrs-light)).
+- **Bulk operations** for batch writes (multi-row `INSERT`, `COPY`, batch APIs) instead of row-by-row loops.
+- **Read `EXPLAIN (ANALYZE)`** for slow queries; fix with indexes or query shape before adding caches.
+- **Always parameterise** — never concatenate user input into SQL. See [security.md](security.md#injection-prevention).
+- **Read replicas** for heavy read traffic, remembering replica lag (read-your-own-writes may need the primary).
 
 ---
 
-## Alembic Migrations
+## Concurrency Control
 
-```python
-# alembic/env.py
-from src.infrastructure.database.models import Base
-from src.config import settings
-
-config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
-target_metadata = Base.metadata
-
-def run_migrations_online():
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-            compare_server_default=True,
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
-
-# Generate: alembic revision --autogenerate -m "Add order status index"
-
-# Migration file example
-def upgrade():
-    op.create_index('idx_orders_status_created', 'orders', ['status', 'created_at'], postgresql_using='btree')
-
-def downgrade():
-    op.drop_index('idx_orders_status_created', 'orders')
+```sql
+-- Optimistic locking: update only if nobody else changed the row
+UPDATE orders
+SET status = 'confirmed', version = version + 1, updated_at = now()
+WHERE id = $1 AND version = $2;
+-- 0 rows affected  => concurrent modification -> fail Conflict, client retries/reloads
 ```
+
+- **Optimistic** (version column) for typical user-facing edits with low contention.
+- **Pessimistic** (`SELECT … FOR UPDATE`, ideally with `SKIP LOCKED` for job queues) for short critical sections with high contention.
+- **Atomic statements** for counters and stock: `UPDATE inventory SET available = available - $2 WHERE product_id = $1 AND available >= $2` — check the affected row count instead of read-then-write.
+- Know your isolation level (Read Committed is the common default); raise it only where anomalies matter.
+
+---
+
+## Migrations
+
+Use a versioned migration tool (Flyway, Liquibase, EF Core, Prisma Migrate, Drizzle Kit, Alembic, Django, golang-migrate, goose, Atlas, sqlx, Diesel, Rails, Laravel, Doctrine, Ecto, …).
+
+```sql
+-- V2024_06_01_1200__add_orders_status_created_index.sql
+-- up
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_orders_status_created ON orders (status, created_at);
+-- down
+DROP INDEX CONCURRENTLY IF EXISTS ix_orders_status_created;
+```
+
+Rules for zero-downtime deploys (old and new code run side by side during a rollout):
+1. **Expand → migrate → contract.** Add the new column/table (nullable or with a default) → deploy code that writes both and reads new → backfill in batches → deploy code that only uses new → drop the old column in a later release.
+2. **Never rename or drop in the same release** as the code change that stops using it.
+3. **Avoid long locks**: build indexes concurrently/online, add constraints as `NOT VALID` then validate, batch large backfills.
+4. **Migrations are code**: reviewed, tested against a production-like copy, run automatically in CI/CD before (or as part of) deployment, and never edited after being applied.
+5. **Seed data** for development lives in a separate script, not in migrations.

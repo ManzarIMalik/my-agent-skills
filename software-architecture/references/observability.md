@@ -1,308 +1,194 @@
 # Observability
 
+Pseudocode conventions are in [SKILL.md](../SKILL.md#pseudocode-conventions). **OpenTelemetry** is the vendor-neutral standard for traces, metrics, and logs with SDKs for every major language; Prometheus-style metrics and JSON logs are understood by every backend. Per-language libraries: [language-adaptation.md](language-adaptation.md#ecosystem-toolbox).
+
 ## Table of Contents
 
-1. [Structured Logging](#structured-logging)
-2. [Metrics with Prometheus](#metrics-with-prometheus)
-3. [Distributed Tracing](#distributed-tracing)
-4. [Health Checks](#health-checks)
+1. [Goals](#goals)
+2. [Structured Logging](#structured-logging)
+3. [Metrics](#metrics)
+4. [Distributed Tracing](#distributed-tracing)
+5. [Health Checks](#health-checks)
+6. [Alerting and SLOs](#alerting-and-slos)
+
+---
+
+## Goals
+
+You should be able to answer, from telemetry alone: *Is it working? For whom is it broken? Where is the time going? What changed?*
+
+- **Logs**: discrete events with context — what happened.
+- **Metrics**: cheap aggregated numbers over time — how much, how fast, how often.
+- **Traces**: the path of one request across components — where.
+
+Correlate all three with a shared **trace ID**.
 
 ---
 
 ## Structured Logging
 
-```python
-import structlog
-from structlog.stdlib import LoggerFactory
+Emit **one JSON object per line** to stdout; let the platform ship it. Never build log lines with string concatenation of business data.
 
-# Configure structlog
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
-logger = structlog.get_logger()
-
-# Usage with context
-async def process_order(order_id: UUID, user_id: UUID):
-    log = logger.bind(order_id=str(order_id), user_id=str(user_id))
-
-    log.info("Processing order")
-
-    try:
-        result = await do_processing()
-        log.info("Order processed successfully", total=result.total)
-    except Exception as e:
-        log.error("Order processing failed", error=str(e), exc_info=True)
-        raise
-
-# Request context middleware
-from contextvars import ContextVar
-
-request_id_var: ContextVar[str] = ContextVar("request_id", default="")
-
-@app.middleware("http")
-async def logging_middleware(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid4()))
-    request_id_var.set(request_id)
-
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        request_id=request_id,
-        path=request.url.path,
-        method=request.method
-    )
-
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-
-    logger.info(
-        "Request completed",
-        status_code=response.status_code,
-        duration_ms=duration * 1000
-    )
-
-    response.headers["X-Request-ID"] = request_id
-    return response
+```json
+{"ts":"2026-03-14T09:26:53.589Z","level":"info","msg":"order placed","service":"order-service","version":"1.4.2","env":"prod","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","request_id":"c0a8012e","order_id":"ord_123","customer_id":"cus_456","total":"59.90","currency":"EUR","duration_ms":42}
 ```
+
+```
+// Bind context once; every subsequent log line carries it
+placeOrder(cmd) {
+  log = logger.with(orderId = cmd.orderId, customerId = cmd.customerId)
+  log.info("placing order")
+  try {
+    result = doPlaceOrder(cmd)
+    log.info("order placed", total = result.total)
+  } catch error {
+    log.error("order placement failed", error = error)   // include error type + stack
+    rethrow error
+  }
+}
+
+// Request-context middleware: request ID + trace ID propagated through async boundaries
+middleware requestContext(req, next) {
+  requestId = req.headers["X-Request-ID"] ?? newId()
+  withLogContext(requestId = requestId, traceId = currentTraceId(), method = req.method, route = req.routeTemplate) {
+    start = monotonicNow()
+    response = next(req)
+    logger.info("request completed", status = response.status, durationMs = monotonicNow() - start)
+    response.headers["X-Request-ID"] = requestId
+    return response
+  }
+}
+```
+
+Context propagation mechanism per language: MDC (Java/SLF4J), `ILogger` scopes / `Activity` (.NET), `AsyncLocalStorage` (Node), `contextvars` (Python), `context.Context` + `slog` (Go), `tracing` spans (Rust), `Logger.metadata` (Elixir), Monolog processors (PHP), tagged logging (Rails).
+
+Rules:
+- **Levels**: `error` = needs attention; `warn` = unexpected but handled; `info` = significant business/lifecycle events; `debug` = developer detail (off in prod by default).
+- **Log the route template** (`/users/{id}`), not the raw path, to keep cardinality sane.
+- **No secrets or unnecessary PII** in logs; redact at the logger level as a backstop.
+- Don't log-and-rethrow at every layer — log once where the error is handled.
 
 ---
 
-## Metrics with Prometheus
+## Metrics
 
-```python
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Response
+Start with the **RED** method per service/endpoint (Rate, Errors, Duration) and **USE** for resources (Utilization, Saturation, Errors).
 
-# Define metrics
-REQUEST_COUNT = Counter(
-    "http_requests_total",
-    "Total HTTP requests",
-    ["method", "endpoint", "status_code"]
-)
-
-REQUEST_LATENCY = Histogram(
-    "http_request_duration_seconds",
-    "HTTP request latency",
-    ["method", "endpoint"],
-    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-)
-
-ACTIVE_REQUESTS = Gauge(
-    "http_requests_active",
-    "Number of active HTTP requests"
-)
-
-DB_QUERY_LATENCY = Histogram(
-    "db_query_duration_seconds",
-    "Database query latency",
-    ["query_type"]
-)
-
-CACHE_HITS = Counter("cache_hits_total", "Cache hit count", ["cache_name"])
-CACHE_MISSES = Counter("cache_misses_total", "Cache miss count", ["cache_name"])
-
-# Middleware
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    ACTIVE_REQUESTS.inc()
-    start_time = time.time()
-
-    try:
-        response = await call_next(request)
-
-        REQUEST_COUNT.labels(
-            method=request.method,
-            endpoint=request.url.path,
-            status_code=response.status_code
-        ).inc()
-
-        REQUEST_LATENCY.labels(
-            method=request.method,
-            endpoint=request.url.path
-        ).observe(time.time() - start_time)
-
-        return response
-    finally:
-        ACTIVE_REQUESTS.dec()
-
-# Metrics endpoint
-@app.get("/metrics")
-async def metrics():
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-# Usage in code
-async def get_user_cached(user_id: str) -> User:
-    cached = await cache.get(f"user:{user_id}")
-    if cached:
-        CACHE_HITS.labels(cache_name="user").inc()
-        return User.parse_raw(cached)
-
-    CACHE_MISSES.labels(cache_name="user").inc()
-    return await fetch_user_from_db(user_id)
 ```
+// Instruments (names follow OpenTelemetry semantic conventions where they exist)
+requests     = meter.counter("http.server.requests", labels = [method, route, status_class])
+latency      = meter.histogram("http.server.request.duration", unit = "s", labels = [method, route],
+                               buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10])
+inFlight     = meter.upDownCounter("http.server.active_requests")
+dbDuration   = meter.histogram("db.client.operation.duration", unit = "s", labels = [operation, table])
+cacheResults = meter.counter("cache.requests", labels = [cache, result])   // result = hit | miss | error
+ordersPlaced = meter.counter("orders.placed", labels = [channel])           // business metric
+
+middleware metrics(req, next) {
+  inFlight.add(1); start = monotonicNow()
+  try {
+    response = next(req)
+    return response
+  } finally {
+    labels = { method: req.method, route: req.routeTemplate, status_class: statusClass(response) }  // "2xx", "5xx"
+    requests.add(1, labels)
+    latency.record(seconds(monotonicNow() - start), labels without status_class)
+    inFlight.add(-1)
+  }
+}
+```
+
+- **Expose** via an OTLP exporter or a Prometheus `/metrics` endpoint (on an internal port).
+- **Cardinality discipline**: never use user IDs, order IDs, raw URLs, or error messages as label values.
+- Use **histograms** for latency (so you can compute p95/p99), not averages.
+- Add **business metrics** (orders placed, payments failed, sign-ups) — they often reveal incidents before technical metrics do.
+- Most frameworks have auto-instrumentation for HTTP, DB, and cache metrics; use it before writing your own.
 
 ---
 
 ## Distributed Tracing
 
-```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-
-# Setup
-def setup_tracing(service_name: str, otlp_endpoint: str):
-    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-
-    exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-
-    trace.set_tracer_provider(provider)
-
-    # Auto-instrument
-    FastAPIInstrumentor.instrument_app(app)
-    SQLAlchemyInstrumentor().instrument(engine=engine)
-    HTTPXClientInstrumentor().instrument()
-
-tracer = trace.get_tracer(__name__)
-
-# Manual spans
-async def process_payment(order_id: UUID, amount: Decimal):
-    with tracer.start_as_current_span("process_payment") as span:
-        span.set_attribute("order_id", str(order_id))
-        span.set_attribute("amount", float(amount))
-
-        try:
-            result = await payment_gateway.charge(amount)
-            span.set_attribute("payment_id", result.payment_id)
-            return result
-        except PaymentError as e:
-            span.set_status(Status(StatusCode.ERROR, str(e)))
-            span.record_exception(e)
-            raise
-
-# Context propagation
-async def call_user_service(user_id: str):
-    with tracer.start_as_current_span("call_user_service") as span:
-        headers = {}
-        inject(headers)  # Inject trace context into headers
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{USER_SERVICE_URL}/users/{user_id}",
-                headers=headers
-            )
-            return response.json()
 ```
+// Setup at startup (composition root)
+setupTelemetry(serviceName, serviceVersion, environment, otlpEndpoint) {
+  resource = { "service.name": serviceName, "service.version": serviceVersion, "deployment.environment": environment }
+  tracerProvider = TracerProvider(resource, exporter = OtlpExporter(otlpEndpoint), sampler = ParentBased(TraceIdRatio(0.1)))
+  enableAutoInstrumentation([httpServer, httpClient, database, cache, messaging])
+}
+
+// Manual span around meaningful business work
+capturePayment(orderId, amount) {
+  span tracer.startActiveSpan("payment.capture") {
+    span.setAttribute("order.id", orderId)
+    span.setAttribute("payment.amount", amount.toString())
+    try {
+      result = gateway.capture(amount)
+      span.setAttribute("payment.id", result.paymentId)
+      return result
+    } catch error {
+      span.recordException(error)
+      span.setStatus(ERROR, error.message)
+      rethrow error
+    }
+  }
+}
+```
+
+- **Propagate context** across every hop using W3C Trace Context headers (`traceparent`, `tracestate`) — HTTP, gRPC metadata, and **message headers** for async events (so traces continue through queues).
+- Auto-instrumentation handles HTTP/DB/clients in most stacks (OpenTelemetry Java agent, .NET instrumentation packages, `@opentelemetry/auto-instrumentations-node`, `opentelemetry-instrument` for Python, eBPF or contrib packages for Go, `tracing-opentelemetry` for Rust).
+- **Sample** intelligently: head-based ratio sampling for volume, tail-based sampling in the collector to keep all errors and slow traces.
+- Run an **OpenTelemetry Collector** between apps and backends to batch, sample, redact, and route without app changes.
 
 ---
 
 ## Health Checks
 
-```python
-from enum import Enum
-from dataclasses import dataclass
+Separate the questions the platform asks:
 
-class HealthStatus(str, Enum):
-    HEALTHY = "healthy"
-    DEGRADED = "degraded"
-    UNHEALTHY = "unhealthy"
+| Endpoint | Question | Checks | On failure |
+|---|---|---|---|
+| `/health/live` (liveness) | Is the process alive and not deadlocked? | Nothing external — just "can I respond" | Platform **restarts** the instance |
+| `/health/ready` (readiness) | Can I serve traffic right now? | Critical dependencies (DB reachable, warmed up, not shutting down) | Removed from load balancer, **not** restarted |
+| `/health/startup` (optional) | Have I finished starting? | Migrations/caches loaded | Liveness checks wait |
+| `/health` (detailed, internal) | Status of each component | All dependencies, with latency | For humans/dashboards |
 
-@dataclass
-class ComponentHealth:
-    name: str
-    status: HealthStatus
-    message: Optional[str] = None
-    latency_ms: Optional[float] = None
-
-@dataclass
-class HealthReport:
-    status: HealthStatus
-    components: list[ComponentHealth]
-    version: str
-    uptime_seconds: float
-
-class HealthChecker:
-    def __init__(self):
-        self._start_time = time.time()
-        self._checks: list[Callable[[], Awaitable[ComponentHealth]]] = []
-
-    def register(self, check: Callable[[], Awaitable[ComponentHealth]]):
-        self._checks.append(check)
-
-    async def check(self) -> HealthReport:
-        components = await asyncio.gather(*[check() for check in self._checks])
-
-        if any(c.status == HealthStatus.UNHEALTHY for c in components):
-            overall = HealthStatus.UNHEALTHY
-        elif any(c.status == HealthStatus.DEGRADED for c in components):
-            overall = HealthStatus.DEGRADED
-        else:
-            overall = HealthStatus.HEALTHY
-
-        return HealthReport(
-            status=overall,
-            components=components,
-            version=settings.version,
-            uptime_seconds=time.time() - self._start_time
-        )
-
-# Component checks
-async def check_database() -> ComponentHealth:
-    start = time.time()
-    try:
-        async with async_session_maker() as session:
-            await session.execute(text("SELECT 1"))
-        return ComponentHealth("database", HealthStatus.HEALTHY, latency_ms=(time.time() - start) * 1000)
-    except Exception as e:
-        return ComponentHealth("database", HealthStatus.UNHEALTHY, message=str(e))
-
-async def check_redis() -> ComponentHealth:
-    start = time.time()
-    try:
-        await redis.ping()
-        return ComponentHealth("redis", HealthStatus.HEALTHY, latency_ms=(time.time() - start) * 1000)
-    except Exception as e:
-        return ComponentHealth("redis", HealthStatus.DEGRADED, message=str(e))
-
-# Endpoints
-health_checker = HealthChecker()
-health_checker.register(check_database)
-health_checker.register(check_redis)
-
-@app.get("/health")
-async def health():
-    report = await health_checker.check()
-    status_code = 200 if report.status == HealthStatus.HEALTHY else 503
-    return JSONResponse(content=asdict(report), status_code=status_code)
-
-@app.get("/health/live")
-async def liveness():
-    return {"status": "ok"}
-
-@app.get("/health/ready")
-async def readiness():
-    report = await health_checker.check()
-    if report.status == HealthStatus.UNHEALTHY:
-        raise HTTPException(status_code=503, detail="Not ready")
-    return {"status": "ready"}
 ```
+enum Health { HEALTHY, DEGRADED, UNHEALTHY }
+record ComponentHealth { name, status: Health, latencyMs: number?, message: string? }
+
+class HealthChecker(checks: List<(name, critical: bool, check: () -> void)>, timeoutPerCheck = 2 seconds) {
+  report() -> { status: Health, components: List<ComponentHealth>, version, uptimeSeconds } {
+    components = runConcurrently(checks, each -> {
+      start = monotonicNow()
+      try { withTimeout(timeoutPerCheck) { each.check() }
+            return ComponentHealth(each.name, HEALTHY, latencyMs = monotonicNow() - start) }
+      catch error {
+            return ComponentHealth(each.name, each.critical ? UNHEALTHY : DEGRADED, message = error.type) }
+    })
+    overall = any UNHEALTHY ? UNHEALTHY : any DEGRADED ? DEGRADED : HEALTHY
+    return { overall, components, version = build.version, uptimeSeconds = uptime() }
+  }
+}
+
+checker = HealthChecker([
+  ("database", critical = true,  () -> db.execute("SELECT 1")),
+  ("cache",    critical = false, () -> cache.ping()),      // app works without cache, just slower
+])
+
+GET /health/live  -> 200 { "status": "ok" }
+GET /health/ready -> shuttingDown or checker.report().status == UNHEALTHY ? 503 : 200
+GET /health       -> checker.report()  (internal only; don't expose dependency details publicly)
+```
+
+- **Liveness must not check dependencies** — a database outage would otherwise restart every instance in a loop.
+- Cache health results for a few seconds so probes don't hammer dependencies.
+- Flip readiness to failing at the **start of graceful shutdown** so traffic drains before exit (see [deployment.md](deployment.md#graceful-shutdown)).
+
+---
+
+## Alerting and SLOs
+
+- Define **SLOs** on user-visible behaviour: e.g. "99.9% of `POST /orders` succeed within 500 ms over 30 days".
+- **Alert on symptoms** (error-budget burn rate, high error rate, high latency) rather than causes (CPU 80%). Cause-based signals belong on dashboards.
+- Every alert should be **actionable** and link to a **runbook** in `docs/runbooks/`.
+- Dashboards per service: RED metrics, saturation (pools, queues, memory), dependency health, deploy markers, key business metrics.

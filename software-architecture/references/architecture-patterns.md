@@ -1,373 +1,277 @@
 # Architecture Patterns
 
+Pseudocode conventions are defined in [SKILL.md](../SKILL.md#pseudocode-conventions). Translate with [language-adaptation.md](language-adaptation.md).
+
 ## Table of Contents
 
 1. [Dependency Injection](#dependency-injection)
-2. [Repository Pattern](#repository-pattern)
-3. [Unit of Work Pattern](#unit-of-work-pattern)
-4. [Service Layer Pattern](#service-layer-pattern)
+2. [Composition Root](#composition-root)
+3. [Repository Pattern](#repository-pattern)
+4. [Unit of Work Pattern](#unit-of-work-pattern)
+5. [Service Layer Pattern](#service-layer-pattern)
+6. [CQRS (Light)](#cqrs-light)
+7. [When Not to Use These](#when-not-to-use-these)
 
 ---
 
 ## Dependency Injection
 
-### Define Interface (Port)
+The core move: a component **receives** its collaborators through its constructor (or function parameters) instead of creating them. The component depends on an **interface (port)**; infrastructure supplies an **implementation (adapter)**.
 
-```python
-from abc import ABC, abstractmethod
-from typing import Protocol
+### Define the Port (application layer)
 
-# Using ABC
-class UserRepository(ABC):
-    @abstractmethod
-    async def get_by_id(self, user_id: str) -> User | None:
-        pass
-
-    @abstractmethod
-    async def get_by_email(self, email: str) -> User | None:
-        pass
-
-    @abstractmethod
-    async def save(self, user: User) -> User:
-        pass
-
-    @abstractmethod
-    async def delete(self, user_id: str) -> None:
-        pass
-
-# Or using Protocol (structural subtyping)
-class UserRepository(Protocol):
-    async def get_by_id(self, user_id: str) -> User | None: ...
-    async def save(self, user: User) -> User: ...
+```
+interface UserRepository {
+  getById(id: UserId) -> User?
+  getByEmail(email: Email) -> User?
+  save(user: User) -> void
+  delete(id: UserId) -> void
+}
 ```
 
-### Implement Adapter
+Keep ports small and shaped by what the *consumer* needs, not by what the database can do. In Go, declare the interface in the consuming package; in languages with structural typing (TS, Go, Python `Protocol`) an implementation doesn't even need to name the interface.
 
-```python
-class PostgresUserRepository(UserRepository):
-    def __init__(self, session: AsyncSession):
-        self._session = session
+### Implement the Adapter (infrastructure layer)
 
-    async def get_by_id(self, user_id: str) -> User | None:
-        result = await self._session.execute(
-            select(UserModel).where(UserModel.id == user_id)
-        )
-        model = result.scalar_one_or_none()
-        return self._to_entity(model) if model else None
-
-    async def save(self, user: User) -> User:
-        model = self._to_model(user)
-        self._session.add(model)
-        await self._session.flush()
-        return user
-
-    def _to_entity(self, model: UserModel) -> User:
-        return User(
-            id=model.id,
-            email=Email(model.email),
-            name=model.name,
-            created_at=model.created_at
-        )
-
-    def _to_model(self, entity: User) -> UserModel:
-        return UserModel(
-            id=entity.id,
-            email=entity.email.value,
-            name=entity.name,
-            created_at=entity.created_at
-        )
 ```
+class SqlUserRepository(db: DatabaseConnection) implements UserRepository {
+  getById(id) -> User? {
+    row = db.queryOne("SELECT id, email, name, created_at FROM users WHERE id = $1", [id])
+    return row ? toEntity(row) : none
+  }
+
+  save(user) {
+    db.execute(
+      "INSERT INTO users (id, email, name, created_at) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name",
+      [user.id, user.email.value, user.name, user.createdAt])
+  }
+
+  // Mapping lives in the adapter so the domain never sees rows/ORM models.
+  private toEntity(row) -> User {
+    return User(id = row.id, email = Email(row.email), name = row.name, createdAt = row.created_at)
+  }
+}
+```
+
+With an ORM, the adapter maps between ORM models and domain entities. In frameworks where the ORM model *is* the domain model (Active Record style), that mapping disappears — acceptable for simpler domains.
 
 ### Use Case with Injected Dependencies
 
-```python
-@dataclass
-class GetUserUseCase:
-    user_repo: UserRepository
-    cache: CacheService
-
-    async def execute(self, user_id: str) -> UserDTO:
-        # Try cache first
-        cached = await self.cache.get(f"user:{user_id}")
-        if cached:
-            return UserDTO.parse_raw(cached)
-
-        # Fetch from repository
-        user = await self.user_repo.get_by_id(user_id)
-        if not user:
-            raise EntityNotFoundError("User", user_id)
-
-        # Cache for next time
-        dto = UserDTO.from_entity(user)
-        await self.cache.set(f"user:{user_id}", dto.json(), ttl=300)
-
-        return dto
 ```
+class GetUserUseCase(users: UserRepository) {
+  execute(id: UserId) -> UserDTO {
+    user = users.getById(id)
+    if user is none: fail NotFound("User", id)
+    return UserDTO.from(user)
+  }
+}
+```
+
+Note: cross-cutting concerns like caching are better added as a decorator around the repository than inside the use case — see [caching.md](caching.md#cached-repository-decorator).
+
+---
+
+## Composition Root
+
+All concrete wiring happens in **one place** at application startup (`main`, `Program`, `bootstrap`, the DI container's module definitions). Everything else receives dependencies.
+
+```
+main() {
+  config   = loadConfig()                         // from env/files, validated at startup
+  dbPool   = Database.connect(config.databaseUrl, poolSize = config.dbPoolSize)
+  cache    = RedisCache(config.redisUrl)
+
+  users    = CachedUserRepository(SqlUserRepository(dbPool), cache, ttl = 5 minutes)
+  getUser  = GetUserUseCase(users)
+
+  server   = HttpServer(routes = [UserRoutes(getUser)])
+  server.start(config.port)
+  onShutdownSignal { server.drain(); dbPool.close(); cache.close() }
+}
+```
+
+Using a DI container (Spring, ASP.NET Core, NestJS, Laravel, Dagger/Hilt, …) is the same idea with registration instead of manual construction. Pay attention to **lifetimes**: singletons for stateless services and pools, request/scoped for things like a unit of work or the current user.
 
 ---
 
 ## Repository Pattern
 
-### Generic Repository Interface
+A repository presents a collection-like interface over persistence for **one aggregate type**.
 
-```python
-from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, Optional
-from uuid import UUID
+### Aggregate-Specific Interface (preferred)
 
-T = TypeVar("T")
-
-class Repository(ABC, Generic[T]):
-    """Generic repository interface."""
-
-    @abstractmethod
-    async def get(self, id: UUID) -> Optional[T]:
-        pass
-
-    @abstractmethod
-    async def find(self, **criteria) -> list[T]:
-        pass
-
-    @abstractmethod
-    async def add(self, entity: T) -> T:
-        pass
-
-    @abstractmethod
-    async def update(self, entity: T) -> T:
-        pass
-
-    @abstractmethod
-    async def delete(self, id: UUID) -> None:
-        pass
-
-    @abstractmethod
-    async def exists(self, id: UUID) -> bool:
-        pass
+```
+interface OrderRepository {
+  get(id: OrderId) -> Order?
+  add(order: Order) -> void
+  update(order: Order) -> void            // or rely on the unit of work's change tracking
+  findByCustomer(id: CustomerId, page: PageRequest) -> Page<Order>
+  findPendingOlderThan(age: Duration) -> List<Order>
+}
 ```
 
-### Domain-Specific Repository
+Name query methods in domain terms (`findPendingOlderThan`) rather than exposing a generic `find(criteria)` that leaks query semantics into the application layer.
 
-```python
-class OrderRepository(Repository[Order]):
-    """Order-specific repository operations."""
+### Generic Base (optional)
 
-    @abstractmethod
-    async def find_by_user(self, user_id: UUID) -> list[Order]:
-        pass
-
-    @abstractmethod
-    async def find_pending(self) -> list[Order]:
-        pass
-
-    @abstractmethod
-    async def find_by_status(self, status: OrderStatus) -> list[Order]:
-        pass
+```
+interface Repository<T, Id> {
+  get(id: Id) -> T?
+  add(entity: T) -> void
+  remove(id: Id) -> void
+  exists(id: Id) -> bool
+}
+interface OrderRepository extends Repository<Order, OrderId> { … }
 ```
 
-### Concrete Implementation
+Useful in languages with good generics and many similar aggregates (Java, C#, TS, Kotlin). Skip it in Go/Elixir/Ruby, and don't build one on top of an ORM that already gives you a generic repository (Spring Data, EF Core `DbSet`).
 
-```python
-class PostgresOrderRepository(OrderRepository):
-    def __init__(self, session: AsyncSession):
-        self._session = session
+### Implementation Concerns
 
-    async def get(self, id: UUID) -> Optional[Order]:
-        result = await self._session.execute(
-            select(OrderModel)
-            .options(selectinload(OrderModel.items))  # Prevent N+1
-            .where(OrderModel.id == id)
-        )
-        model = result.scalar_one_or_none()
-        return self._to_entity(model) if model else None
-
-    async def find_by_user(self, user_id: UUID) -> list[Order]:
-        result = await self._session.execute(
-            select(OrderModel)
-            .options(selectinload(OrderModel.items))
-            .where(OrderModel.user_id == user_id)
-            .order_by(OrderModel.created_at.desc())
-        )
-        return [self._to_entity(m) for m in result.scalars().all()]
-
-    async def add(self, entity: Order) -> Order:
-        model = self._to_model(entity)
-        self._session.add(model)
-        await self._session.flush()
-        await self._session.refresh(model)
-        return self._to_entity(model)
-```
+- **Load the whole aggregate** the domain needs in a bounded number of queries — avoid N+1 by eager-loading children (join or batched "IN" query). See [database-patterns.md](database-patterns.md#query-optimization).
+- **Return domain objects, not rows or ORM entities.**
+- **Don't put business rules in repositories** — they persist and retrieve; the domain decides.
 
 ---
 
 ## Unit of Work Pattern
 
+A unit of work groups changes to several repositories into **one transaction**.
+
 ### Interface
 
-```python
-class UnitOfWork(ABC):
-    """Unit of Work manages transactions across multiple repositories."""
-
-    users: UserRepository
-    orders: OrderRepository
-    payments: PaymentRepository
-
-    @abstractmethod
-    async def __aenter__(self) -> "UnitOfWork":
-        pass
-
-    @abstractmethod
-    async def __aexit__(self, *args) -> None:
-        pass
-
-    @abstractmethod
-    async def commit(self) -> None:
-        pass
-
-    @abstractmethod
-    async def rollback(self) -> None:
-        pass
+```
+interface UnitOfWork {
+  users:    UserRepository
+  orders:   OrderRepository
+  payments: PaymentRepository
+  outbox:   OutboxRepository
+  commit() -> void
+  rollback() -> void
+}
+interface UnitOfWorkFactory { begin() -> UnitOfWork }
 ```
 
 ### Implementation
 
-```python
-class SQLAlchemyUnitOfWork(UnitOfWork):
-    def __init__(self, session_factory):
-        self._session_factory = session_factory
-        self._session: AsyncSession | None = None
-
-    async def __aenter__(self) -> "SQLAlchemyUnitOfWork":
-        self._session = self._session_factory()
-        self.users = PostgresUserRepository(self._session)
-        self.orders = PostgresOrderRepository(self._session)
-        self.payments = PostgresPaymentRepository(self._session)
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            await self.rollback()
-        await self._session.close()
-
-    async def commit(self) -> None:
-        await self._session.commit()
-
-    async def rollback(self) -> None:
-        await self._session.rollback()
+```
+class SqlUnitOfWork(conn: DatabaseConnection) implements UnitOfWork {
+  init      { conn.beginTransaction() }
+  users     = SqlUserRepository(conn)      // all repositories share the same connection/transaction
+  orders    = SqlOrderRepository(conn)
+  payments  = SqlPaymentRepository(conn)
+  outbox    = SqlOutboxRepository(conn)
+  commit()   { conn.commit() }
+  rollback() { conn.rollback() }
+  close()    { if not committed: rollback(); conn.release() }   // always runs (finally/defer/Drop/using)
+}
 ```
 
 ### Usage
 
-```python
-@dataclass
-class CreateOrderUseCase:
-    uow_factory: Callable[[], UnitOfWork]
-    event_bus: EventBus
-
-    async def execute(self, command: CreateOrderCommand) -> OrderDTO:
-        async with self.uow_factory() as uow:
-            # Validate user exists
-            user = await uow.users.get(command.user_id)
-            if not user:
-                raise EntityNotFoundError("User", str(command.user_id))
-
-            # Create order
-            order = Order.create(user_id=command.user_id, items=command.items)
-            saved_order = await uow.orders.add(order)
-
-            # Process payment
-            payment = Payment.create(order_id=saved_order.id, amount=saved_order.total)
-            await uow.payments.add(payment)
-
-            # Commit transaction
-            await uow.commit()
-
-            # Publish events (after commit)
-            await self.event_bus.publish(OrderCreatedEvent.from_entity(saved_order))
-
-            return OrderDTO.from_entity(saved_order)
 ```
+class PlaceOrderUseCase(uowFactory: UnitOfWorkFactory) {
+  execute(cmd: PlaceOrderCommand) -> OrderDTO {
+    transaction uowFactory.begin() as uow {
+      customer = uow.users.getById(cmd.customerId)
+      if customer is none: fail NotFound("User", cmd.customerId)
+
+      order = Order.create(customer.id, cmd.items)
+      uow.orders.add(order)
+      uow.payments.add(Payment.pending(order.id, order.total))
+      uow.outbox.add(order.pullEvents())   // events committed atomically with state
+
+      uow.commit()
+      return OrderDTO.from(order)
+    }
+  }
+}
+```
+
+Do **not** call external services (payment gateways, emails, other microservices) inside the database transaction — the transaction can't roll them back, and holding locks while waiting on a network call hurts throughput. Commit first, then trigger side effects from the outbox. See [event-driven.md](event-driven.md#transactional-outbox).
+
+Many frameworks provide this already (`@Transactional`, EF Core `DbContext.SaveChanges`, `Repo.transaction`/`Ecto.Multi`, Rails `transaction do`, Laravel `DB::transaction`). Use the built-in mechanism and just keep the *boundary* in the application layer.
 
 ---
 
 ## Service Layer Pattern
 
-### Domain Service
+### Domain Service — pure business logic that doesn't belong to one entity
 
-```python
-class PricingService:
-    """Domain service for pricing calculations."""
+```
+class PricingService {
+  calculateDiscount(customer: Customer, items: List<OrderItem>, promo: PromoCode?) -> Discount {
+    base       = sum(item.unitPrice × item.quantity for item in items)
+    tierAmount = base × tierRate(customer.tier)
+    promoAmount = promo ? promo.discountFor(base) : Money.zero(base.currency)
 
-    def calculate_discount(
-        self,
-        user: User,
-        items: list[OrderItem],
-        promo_code: Optional[str] = None
-    ) -> Discount:
-        base_total = sum(item.price * item.quantity for item in items)
+    return tierAmount >= promoAmount
+      ? Discount(tierAmount, reason = "tier")
+      : Discount(promoAmount, reason = "promo")
+  }
 
-        # User tier discount
-        tier_discount = self._calculate_tier_discount(user.tier, base_total)
-
-        # Promo code discount
-        promo_discount = Decimal("0")
-        if promo_code:
-            promo_discount = self._calculate_promo_discount(promo_code, base_total)
-
-        # Take the better discount
-        discount_amount = max(tier_discount, promo_discount)
-
-        return Discount(
-            amount=discount_amount,
-            reason="tier" if tier_discount > promo_discount else "promo"
-        )
-
-    def _calculate_tier_discount(self, tier: UserTier, total: Decimal) -> Decimal:
-        rates = {
-            UserTier.BRONZE: Decimal("0.05"),
-            UserTier.SILVER: Decimal("0.10"),
-            UserTier.GOLD: Decimal("0.15"),
-        }
-        return total * rates.get(tier, Decimal("0"))
+  private tierRate(tier) -> Decimal {
+    match tier { BRONZE -> 0.05, SILVER -> 0.10, GOLD -> 0.15, else -> 0 }
+  }
+}
 ```
 
-### Application Service
+No I/O, no framework — trivially unit-testable. Use exact decimal types for money (`BigDecimal`, `decimal`, `Decimal`, integer minor units), never binary floating point.
 
-```python
-@dataclass
-class OrderApplicationService:
-    """Application service for order operations."""
+### Application Service — orchestration, no business rules
 
-    order_repo: OrderRepository
-    inventory_service: InventoryService
-    pricing_service: PricingService
-    notification_service: NotificationService
-    event_bus: EventBus
-
-    async def create_order(self, command: CreateOrderCommand) -> OrderDTO:
-        # Check inventory
-        for item in command.items:
-            available = await self.inventory_service.check_availability(
-                item.product_id, item.quantity
-            )
-            if not available:
-                raise InsufficientInventoryError(
-                    item.product_id, item.quantity,
-                    await self.inventory_service.get_quantity(item.product_id)
-                )
-
-        # Calculate pricing
-        discount = self.pricing_service.calculate_discount(
-            user=command.user, items=command.items, promo_code=command.promo_code
-        )
-
-        # Create and save order
-        order = Order.create(user_id=command.user_id, items=command.items, discount=discount)
-        await self.inventory_service.reserve(order.items)
-        saved_order = await self.order_repo.add(order)
-
-        # Notifications and events
-        await self.notification_service.send_order_confirmation(saved_order)
-        await self.event_bus.publish(OrderCreatedEvent.from_entity(saved_order))
-
-        return OrderDTO.from_entity(saved_order)
 ```
+class OrderApplicationService(
+  uowFactory: UnitOfWorkFactory,
+  inventory:  InventoryPort,
+  pricing:    PricingService
+) {
+  placeOrder(cmd: PlaceOrderCommand) -> OrderDTO {
+    for item in cmd.items {
+      available = inventory.availableQuantity(item.productId)
+      if available < item.quantity:
+        fail InsufficientInventory(item.productId, item.quantity, available)
+    }
+
+    transaction uowFactory.begin() as uow {
+      customer = uow.users.getById(cmd.customerId) ?? fail NotFound("User", cmd.customerId)
+      discount = pricing.calculateDiscount(customer, cmd.items, cmd.promoCode)
+      order    = Order.create(customer.id, cmd.items, discount)
+
+      uow.orders.add(order)
+      uow.outbox.add(order.pullEvents())   // inventory reservation + confirmation email react to OrderPlaced
+      uow.commit()
+      return OrderDTO.from(order)
+    }
+  }
+}
+```
+
+The availability check is an optimisation for fast feedback; the authoritative reservation must still be atomic (in the inventory store or via a saga), since stock can change between check and reserve.
+
+---
+
+## CQRS (Light)
+
+Separate **commands** (change state, go through the domain model) from **queries** (read state, can bypass the domain and read optimised projections directly).
+
+```
+// Command side: full domain model, invariants enforced
+PlaceOrderUseCase.execute(PlaceOrderCommand) -> OrderId
+
+// Query side: thin, fast, shaped for the screen/API
+interface OrderQueries {
+  orderSummariesForCustomer(customerId, page) -> Page<OrderSummaryView>   // straight SQL/view/read model
+}
+```
+
+Start with both sides on the same database. Move to separate read models (denormalised tables, search index) only when read and write needs genuinely diverge.
+
+---
+
+## When Not to Use These
+
+- **Pure CRUD with no rules**: a handler calling a data-access layer (or the framework's ORM directly) is fine. Add layers when rules appear.
+- **ORM already provides repository + unit of work** (EF Core, Hibernate, Ecto, Active Record): don't wrap it in an identical abstraction unless you need to keep the domain persistence-ignorant or swap stores.
+- **Scripts, prototypes, one-off tools**: keep it simple; architecture is for code you'll maintain.
